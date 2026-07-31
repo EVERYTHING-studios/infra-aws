@@ -4,6 +4,8 @@ on:
   pull_request:
   push:
     branches: [main]
+  release:
+    types: [published]
 
 permissions:
   id-token: write # OIDC federation to AWS
@@ -124,8 +126,8 @@ jobs:
 
   apply-production:
     name: apply production
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.AWS_APPLY_ROLE_ARN != ''
-    needs: [apply-staging]
+    if: github.event_name == 'release' && github.event.action == 'published' && vars.AWS_APPLY_ROLE_ARN != ''
+    needs: [test-service, validate]
     runs-on: ubuntu-latest
     environment: production # gate with required reviewers in repo settings
     concurrency: apply-production
