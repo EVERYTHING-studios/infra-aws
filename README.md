@@ -3,6 +3,31 @@
 Infrastructure-as-code for EVERYTHING Studios' AWS services, starting with
 **generate** — the in-house 3D generation service that replaces Meshy.ai.
 
+## Applying to a single environment
+
+`envs/staging` and `envs/production` are independent composition roots, each with
+its own S3 state key (`envs/<env>/terraform.tfstate`). Running Terraform in one
+never touches the other — just `cd` into the env you want:
+
+```bash
+cd envs/staging      # or: cd envs/production
+terraform init
+terraform apply
+```
+
+CI never applies. It only plans both `envs/staging` and `envs/production` and fails
+the check if either shows a pending diff — on every PR (blocking) and again on
+push to `main` (non-blocking drift alarm; see `.github/workflows/terraform.yml`).
+Applying is always a manual, local step using the engineer's own AWS credentials,
+and must be done for both environments *before* merging a PR with infra changes.
+
+Because CI can't gate a merge on the target branch having moved since your last
+plan, consider enabling GitHub's "require branches to be up to date before
+merging" branch protection rule to catch a PR going stale relative to a
+concurrently-merged one. That specific rule requires GitHub Pro/Team on a private
+repo (not available on Free), so it's optional — enable it manually if your plan
+supports it.
+
 ## What lives here
 
 ```
@@ -14,12 +39,12 @@ infra-aws/
 │   ├── generate-tasks/      # DynamoDB task table
 │   ├── generate-pipeline/   # Step Functions pipeline, work bucket, webhook dispatcher, Fargate post-process
 │   ├── generate-inference/  # Inference backend (stub Lambda today, SageMaker later)
-│   └── ci-oidc/             # GitHub Actions OIDC provider + plan/apply roles (used by bootstrap)
+│   └── ci-oidc/             # GitHub Actions OIDC provider (data source) + plan role (used by bootstrap)
 ├── services/generate/       # TypeScript Lambda source (esbuild-bundled to dist/)
 ├── containers/postprocess/  # Blender headless container: GLB → FBX/OBJ/USDZ + thumbnail
 ├── envs/staging/            # Composition root for staging
 ├── envs/production/         # Composition root for production
-└── .github/workflows/       # CI: fmt/validate/test on PR, plan, apply on main
+└── .github/workflows/       # CI: fmt/validate/test, plan-only drift check on PR + main
 ```
 
 ## The generate service
@@ -68,13 +93,13 @@ terraform apply           # creates the TF state bucket + GitHub OIDC provider +
 ```
 
 Then configure the GitHub repo:
-1. Repo **variables**: `AWS_PLAN_ROLE_ARN`, `AWS_APPLY_ROLE_ARN` (from bootstrap outputs).
-2. GitHub **environments**: `staging` (no protection) and `production` (required reviewers).
+1. Repo **variables**: `AWS_PLAN_ROLE_ARN` (from bootstrap outputs).
+2. GitHub **environments**: `staging` and `production` (as needed for any non-CI use).
 
 ## Deploying an environment
 
-CI does this automatically (plan on PR, apply staging on merge to main, apply production
-behind an environment approval). Manually:
+CI never applies — it only plans and fails the check on a pending diff. Deploying is
+always this manual step, run locally with your own AWS credentials, before merging:
 
 ```bash
 cd services/generate && npm ci && npm run build   # bundles Lambdas to dist/
