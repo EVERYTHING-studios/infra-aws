@@ -44,7 +44,7 @@ resource "aws_iam_role_policy_attachment" "basic_execution" {
 }
 
 resource "aws_iam_role_policy" "inline" {
-  count = var.policy_json == null ? 0 : 1
+  count = var.attach_policy ? 1 : 0
 
   name   = "permissions"
   role   = aws_iam_role.this.id

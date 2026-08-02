@@ -37,6 +37,7 @@ module "authorizer" {
   dist_dir      = "${var.dist_dir}/authorizer"
   timeout       = 10
   policy_json   = data.aws_iam_policy_document.authorizer.json
+  attach_policy = true
 
   environment = {
     API_KEY_SECRET_ARN = var.api_key_secret_arn
@@ -71,6 +72,7 @@ module "create_task" {
   dist_dir      = "${var.dist_dir}/create-task"
   timeout       = 30
   policy_json   = data.aws_iam_policy_document.create_task.json
+  attach_policy = true
 
   environment = {
     TASKS_TABLE       = var.tasks_table_name
@@ -92,6 +94,7 @@ module "get_task" {
   dist_dir      = "${var.dist_dir}/get-task"
   timeout       = 10
   policy_json   = data.aws_iam_policy_document.get_task.json
+  attach_policy = true
 
   environment = {
     TASKS_TABLE = var.tasks_table_name
@@ -122,6 +125,7 @@ module "cancel_task" {
   dist_dir      = "${var.dist_dir}/cancel-task"
   timeout       = 30
   policy_json   = data.aws_iam_policy_document.cancel_task.json
+  attach_policy = true
 
   environment = {
     TASKS_TABLE       = var.tasks_table_name

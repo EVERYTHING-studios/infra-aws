@@ -20,6 +20,12 @@ variable "policy_json" {
   default     = null
 }
 
+variable "attach_policy" {
+  description = "Whether to create the inline IAM policy. Must be a static true/false from the caller, not derived from policy_json's content — policy_json's value can be unknown at plan time on first apply (e.g. when it references a resource created in the same plan), which would make a count/for_each based on that value fail."
+  type        = bool
+  default     = false
+}
+
 variable "timeout" {
   description = "Function timeout in seconds."
   type        = number

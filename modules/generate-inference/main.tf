@@ -37,6 +37,7 @@ module "stub" {
   timeout       = 120
   memory_size   = 512
   policy_json   = data.aws_iam_policy_document.stub.json
+  attach_policy = true
 
   environment = {
     TASKS_TABLE = var.tasks_table_name

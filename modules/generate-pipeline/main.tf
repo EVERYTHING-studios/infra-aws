@@ -80,6 +80,7 @@ module "prepare" {
   timeout       = 120
   memory_size   = 512
   policy_json   = data.aws_iam_policy_document.prepare.json
+  attach_policy = true
 
   environment = {
     TASKS_TABLE       = var.tasks_table_name
@@ -114,6 +115,7 @@ module "postprocess_lite" {
   timeout       = 120
   memory_size   = 512
   policy_json   = data.aws_iam_policy_document.postprocess_lite.json
+  attach_policy = true
 
   environment = {
     TASKS_TABLE   = var.tasks_table_name
@@ -150,6 +152,7 @@ module "finalize" {
   dist_dir      = "${var.dist_dir}/finalize"
   timeout       = 60
   policy_json   = data.aws_iam_policy_document.finalize.json
+  attach_policy = true
 
   environment = {
     TASKS_TABLE                = var.tasks_table_name
@@ -178,6 +181,7 @@ module "fail_task" {
   dist_dir      = "${var.dist_dir}/fail-task"
   timeout       = 60
   policy_json   = data.aws_iam_policy_document.fail_task.json
+  attach_policy = true
 
   environment = {
     TASKS_TABLE       = var.tasks_table_name
@@ -208,6 +212,7 @@ module "webhook_dispatch" {
   dist_dir      = "${var.dist_dir}/webhook-dispatch"
   timeout       = 30
   policy_json   = data.aws_iam_policy_document.webhook_dispatch.json
+  attach_policy = true
 
   environment = {
     WEBHOOK_URL        = var.webhook_url
