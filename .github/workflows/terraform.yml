@@ -94,8 +94,8 @@ jobs:
         with:
           script: |
             const exitcode = '${{ steps.plan.outputs.exitcode }}';
-            const status = exitcode === '0' ? 'no changes' : exitcode === '2' ? 'changes pending' : 'error';
-            const output = `#### Terraform plan — \`${{ matrix.env }}\`: \`${status}\`
+            const status = exitcode === '0' ? '✅ No changes — up to date' : exitcode === '2' ? '⚠️ Changes pending' : '❌ Error';
+            const output = `#### Terraform plan — \`${{ matrix.env }}\`: ${status}
             <details><summary>Show plan</summary>
 
             \`\`\`
