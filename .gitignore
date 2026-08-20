@@ -1,0 +1,15 @@
+# Terraform
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+crash.log
+
+# Lambda build output
+services/generate/dist/
+services/generate/node_modules/
+*.zip
+
+# Local env
+.env
+.env.*
