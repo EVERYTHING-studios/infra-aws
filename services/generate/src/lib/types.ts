@@ -90,6 +90,8 @@ export interface TaskRecord {
   thumbnail_url?: string;
   error?: TaskError;
   execution_arn?: string;
+  /** Step Functions task token, set by the SageMaker dispatcher and consumed by the callback to resume the state machine. */
+  sagemaker_task_token?: string;
   inference_backend?: string;
   idempotency_key?: string;
   created_at: string;

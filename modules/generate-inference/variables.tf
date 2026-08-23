@@ -23,3 +23,25 @@ variable "work_bucket_name" {
 variable "work_bucket_arn" {
   type = string
 }
+
+variable "env" {
+  description = "Environment name (staging|production). Selects the per-env SSM namespace and bucket suffix."
+  type        = string
+}
+
+variable "inference_backend" {
+  description = "Backend for the Inference state: stub (default) | sagemaker."
+  type        = string
+  default     = "stub"
+
+  validation {
+    condition     = contains(["stub", "sagemaker"], var.inference_backend)
+    error_message = "inference_backend must be 'stub' or 'sagemaker'."
+  }
+}
+
+variable "postprocess_mode" {
+  description = "Post-process path (lite|fargate); forwarded to the SageMaker callback so it can reconstruct the pipeline context."
+  type        = string
+  default     = "lite"
+}

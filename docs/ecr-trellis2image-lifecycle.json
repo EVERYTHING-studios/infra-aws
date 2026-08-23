@@ -1,0 +1,10 @@
+{
+  "rules": [
+    {
+      "rulePriority": 1,
+      "description": "Prune untagged images older than 14 days; keep all tagged images.",
+      "selection": { "tagStatus": "untagged", "countType": "sinceImagePushed", "countUnit": "days", "countNumber": 14 },
+      "action": { "type": "expire" }
+    }
+  ]
+}

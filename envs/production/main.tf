@@ -110,13 +110,16 @@ module "tasks" {
 
 module "inference" {
   source = "../../modules/generate-inference"
+  env    = local.env
 
-  name_prefix      = local.name_prefix
-  dist_dir         = local.dist_dir
-  tasks_table_name = module.tasks.table_name
-  tasks_table_arn  = module.tasks.table_arn
-  work_bucket_name = aws_s3_bucket.work.bucket
-  work_bucket_arn  = aws_s3_bucket.work.arn
+  name_prefix       = local.name_prefix
+  dist_dir          = local.dist_dir
+  tasks_table_name  = module.tasks.table_name
+  tasks_table_arn   = module.tasks.table_arn
+  work_bucket_name  = aws_s3_bucket.work.bucket
+  work_bucket_arn   = aws_s3_bucket.work.arn
+  inference_backend = var.inference_backend
+  postprocess_mode  = var.postprocess_mode
 }
 
 module "pipeline" {

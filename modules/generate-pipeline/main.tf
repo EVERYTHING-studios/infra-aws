@@ -415,16 +415,21 @@ resource "aws_sfn_state_machine" "pipeline" {
   name     = "${var.name_prefix}-pipeline"
   role_arn = aws_iam_role.sfn.arn
 
-  definition = templatefile("${path.module}/state-machine.asl.json.tftpl", {
-    prepare_arn          = module.prepare.arn
-    inference_arn        = var.inference_lambda_arn
-    postprocess_lite_arn = module.postprocess_lite.arn
-    finalize_arn         = module.finalize.arn
-    fail_task_arn        = module.fail_task.arn
-    cluster_arn          = aws_ecs_cluster.this.arn
-    task_definition_arn  = aws_ecs_task_definition.postprocess.arn
-    container_name       = local.container_name
-    subnets_json         = jsonencode(var.subnet_ids)
-    security_group_id    = aws_security_group.postprocess.id
-  })
+  definition = templatefile(
+    var.inference_backend == "sagemaker"
+    ? "${path.module}/state-machine-sagemaker.asl.json.tftpl"
+    : "${path.module}/state-machine.asl.json.tftpl",
+    {
+      prepare_arn          = module.prepare.arn
+      inference_arn        = var.inference_lambda_arn
+      postprocess_lite_arn = module.postprocess_lite.arn
+      finalize_arn         = module.finalize.arn
+      fail_task_arn        = module.fail_task.arn
+      cluster_arn          = aws_ecs_cluster.this.arn
+      task_definition_arn  = aws_ecs_task_definition.postprocess.arn
+      container_name       = local.container_name
+      subnets_json         = jsonencode(var.subnet_ids)
+      security_group_id    = aws_security_group.postprocess.id
+    }
+  )
 }

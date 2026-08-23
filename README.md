@@ -38,7 +38,7 @@ infra-aws/
 │   ├── generate-api/        # HTTP API Gateway, custom domain, authorizer, task CRUD Lambdas
 │   ├── generate-tasks/      # DynamoDB task table
 │   ├── generate-pipeline/   # Step Functions pipeline, work bucket, webhook dispatcher, Fargate post-process
-│   ├── generate-inference/  # Inference backend (stub Lambda today, SageMaker later)
+│   ├── generate-inference/  # Inference backend (stub Lambda or SageMaker async; SageMaker is live in staging)
 │   └── ci-oidc/             # GitHub Actions OIDC provider (data source) + plan role (used by bootstrap)
 ├── services/generate/       # TypeScript Lambda source (esbuild-bundled to dist/)
 ├── containers/postprocess/  # Blender headless container: GLB → FBX/OBJ/USDZ + thumbnail
@@ -80,7 +80,7 @@ web-app ◀──HMAC-signed webhook◀── dispatch λ ◀── SQS ◀─�
   with `x-generate-timestamp`. Delivery is SQS-backed with 5 retries → DLQ + alarm.
 - **Inference is pluggable** via `INFERENCE_BACKEND`:
   - `stub` (today): copies a fixture GLB through the pipeline so everything is E2E-testable.
-  - `sagemaker` (planned): async inference endpoints; see [SageMaker plan](#sagemaker-forward-plan).
+  - `sagemaker` (live in staging): async inference endpoints; see [SageMaker inference backend](#sagemaker-inference-backend).
 
 ## One-time bootstrap
 
@@ -151,21 +151,45 @@ watch -n 2 "curl -s $API/v1/tasks/$TASK -H 'x-api-key: $KEY' | jq '{status, prog
 #   webhook POSTed to the configured webhook_url.
 ```
 
-## SageMaker forward plan
+## SageMaker inference backend
 
 The real model swaps in behind the same pipeline contract (work-bucket input prefix in,
 GLB at `tasks/{task_id}/raw/model.glb` out) by setting `INFERENCE_BACKEND=sagemaker` and
 adding the `generate-inference/sagemaker` submodule:
 
+- **Model**: TRELLIS.2-4B (`microsoft/TRELLIS.2-4B`) is the chosen model. The inference image
+  is in ECR as `trellis2image:c374e66-serve-fix`
+  (`095256591532.dkr.ecr.us-east-1.amazonaws.com/trellis2image:c374e66-serve-fix`), and the SSM params
+  `/trellis2image/ecr/repository_uri` and `/trellis2image/ecr/image_uri` are written.
 - **SageMaker async inference** endpoints: S3 in/out, SNS success/error topics → callback
   Lambda → `SendTaskSuccess` (the state machine's inference state becomes `.waitForTaskToken`).
-- **Scale-to-zero**: autoscaling on `ApproximateBacklogSize`, min 0 — multi-minute cold
-  starts are fine for an async pipeline.
-- **Model candidates** (early 2026): image-to-3D — Hunyuan3D-2.1 (open weights; its separate
-  shape-gen and PBR texture-paint stages map directly onto our preview/refine split),
-  TRELLIS, TripoSG; budget tier — Stable Fast 3D. Text-to-3D runs as text→image
-  (FLUX/SDXL or Bedrock) chained into image-to-3D as an extra pipeline state.
-- **Instances**: `ml.g5.2xlarge` to start, `ml.g6e.2xlarge` for larger models.
+  The container returns GLB bytes directly from `/invocations`; SageMaker writes them to the
+  configured `S3OutputPath` — the container does **not** write to S3 itself.
+- **Scale-to-zero**: autoscaling on `HasBacklogWithoutCapacity`, `MinCapacity = 0`,
+  `MaxCapacity = 2` — multi-minute cold starts are fine for an async pipeline.
+- **Instances**: `ml.g6e.2xlarge` (L40S, 45 GB VRAM, 8 vCPU, 64 GiB RAM) — the current
+  steady-state instance. `ml.g5.2xlarge` (A10G, 24 GB) was the target but had endpoint-quota=0;
+  `ml.g5.xlarge` had `InsufficientInstanceCapacity`. If the g5.2xlarge quota increase is approved,
+  the instance can flip back. Multi-GPU instances (g5.12x+, p4d, p5) waste all but one GPU on
+  this single-GPU-per-render workload. See `trellis2image/docs/instance-sizing.md`.
+- **Contract**: the precise SSM parameter handoff, IAM, and resource list is in
+  `trellis2image/docs/sagemaker-iac-contract.md` (this repo is app-only; Terraform lives here).
+
+### Deployed
+
+All three phases are ✅ DONE in staging:
+
+- **Phase 1** ✅: S3 buckets (weights, input, output), SSM phase-1 params, SageMaker execution
+  role (with `s3:ListBucket`+`s3:PutObject` on output bucket, `sns:Publish` on SNS topics).
+- **Phase 2** ✅: TRELLIS.2 pipeline weights packaged as `model.tar.gz` (~13.3 GB, symlink-free
+  via `--dereference`) and uploaded to the weights bucket.
+- **Phase 3** ✅: SageMaker Model (`ModelDataSource.S3DataSource`, not `ModelDataUrl`),
+  EndpointConfig (`ml.g6e.2xlarge`, `container_startup_health_check_timeout = 600`),
+  Endpoint (InService), autoscaling (min=0/max=2, `ChangeInCapacity` step scaling), dispatcher
+  + callback Lambdas, state machine `.waitForTaskToken` wiring.
+
+**Remaining:** e2e verification (submit a test task via the staging API) and production cutover
+(after staging is validated).
 
 ## Conventions
 

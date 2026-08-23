@@ -77,6 +77,7 @@ export interface TaskUpdate {
   error?: TaskRecord['error'];
   execution_arn?: string;
   inference_backend?: string;
+  sagemaker_task_token?: string;
   finished_at?: string;
 }
 
