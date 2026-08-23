@@ -29,11 +29,90 @@ TRELLIS.2-4B (`microsoft/TRELLIS.2-4B`) is the chosen model. Image:
   `getTask(task_id)`.
 - Callback Lambda subscribed to the SNS success/error topics: on success reads
   the GLB from the SageMaker output bucket, copies it to
-  `tasks/{task_id}/raw/model.glb` in the work bucket, and calls
-  `states:SendTaskSuccess`; on error calls `SendTaskFailure`.
+  `tasks/{task_id}/raw/model.glb` in the work bucket, calls
+  `states:SendTaskSuccess`, then clears `sagemaker_task_token` from the task
+  record; on error calls `SendTaskFailure` and clears the token. The token is
+  cleared after the SFN call so SNS retries can still recover it if the SFN call
+  throws.
 - Application Auto Scaling on the endpoint variant with `min_capacity = 0`
-  (scale-to-zero), `max_capacity = 2`; scale-up on `HasBacklogWithoutCapacity`,
-  scale-in target tracking with `ScaleInCooldown = 300`.
+  (scale-to-zero), `max_capacity = 2`. Scale-up on `HasBacklogWithoutCapacity`
+  (2 consecutive periods); scale-down on a custom `EndpointIdle` metric
+  published by the `endpoint-scaler` Lambda (3 consecutive idle minutes). See
+  [Scale-to-zero](#scale-to-zero) below.
+- `endpoint-scaler` Lambda (EventBridge `rate(1 minute)`): queries DynamoDB GSI2
+  for IN_PROGRESS tasks with an active `sagemaker_task_token`, publishes
+  `EndpointIdle = 0` (busy) or `1` (idle) to CloudWatch namespace
+  `EverythingStudios/SageMaker`. Safe default `0` on error — never scale down on
+  monitoring failure.
+
+## Scale-to-zero
+
+The async endpoint scales to zero when idle, so you only pay for GPU time when
+a request is actually in flight. Two alarms drive the autoscaling policies:
+
+- **Scale-up** (`HasBacklogWithoutCapacity >= 1` for 2 min): fires when a request
+  is queued with no instance to serve it. Step scaling `+1`, 300s cooldown.
+- **Scale-to-zero** (`EndpointIdle >= 1` for 3 min): fires when no in-flight
+  SageMaker invocation has an active `sagemaker_task_token`. Step scaling `-1`,
+  180s cooldown. `treat_missing_data = breaching` — if the scaler Lambda stops
+  publishing, the alarm fires after 3 min as a safety measure rather than
+  keeping the instance alive forever.
+
+### Why a custom metric
+
+SageMaker's built-in `HasBacklogWithoutCapacity` drops to 0 the moment a queued
+request is **picked up** by the instance — not when inference **completes**.
+With short evaluation periods the scale-down alarm fires mid-inference, killing
+the instance and causing an endless scale-up/scale-down cycle that never
+completes a request. Extending the evaluation periods to 15 (the old workaround)
+made it safe but wasted 15 min of idle billing before each scale-down.
+
+The fix: the `endpoint-scaler` Lambda publishes a custom `EndpointIdle` metric
+every minute. The callback Lambda clears the `sagemaker_task_token` after the
+SNS success/failure notification, so the metric drops to idle only after
+inference truly finishes. Scale-to-zero then fires in ~3 min, not 15.
+
+### Cold-run measurement
+
+`scripts/measure-endpoint.sh` produces a billable breakdown for a single task.
+Pass a `TASK_ID` to measure one run end-to-end:
+
+```bash
+AWS_PROFILE=aman-aws TASK_ID=<task_id> bash scripts/measure-endpoint.sh
+```
+
+The report decomposes the billable window (scale-up start -> scale-in end) into:
+
+- **Cold start** — provisioning + model download + GPU weights load (first
+  invocation timestamp - scale-up start). ~10 min on `ml.g5.2xlarge`.
+- **Inference GPU** — `ModelLatency` sum (actual GPU work). ~6.5 min for
+  TRELLIS.2-4B image-to-3d.
+- **Cooldown** — scale-in end - last invocation (3 evaluation periods + the
+  scale-down activity). ~3 min with the custom-metric alarm.
+- **Idle fraction** — `(cold start + cooldown) / billable`, the fraction of the
+  billable window that is not useful GPU work.
+
+Reference cold run (`ml.g5.2xlarge`, 2026-08-23, task
+`01M0QNQM563TP1BJEG08F9CPYQ`):
+
+```
+Run type:           COLD (scale 0 -> 1)
+Billable window:    920s
+  Cold start:       643s  (provision + download + weights load)
+  Inference GPU:    396s  (useful work)
+  Cooldown:         277s  (last invocation -> scale-in end)
+  Idle fraction:    100%  (cold start + cooldown / billable)
+Queue wait:         850s  (request queued while instance provisioned)
+Task wall-clock:    899s  (SUCCEEDED)
+Hourly rate:        $1.52/hr (ml.g5.2xlarge)
+Est cost:           $0.39
+```
+
+The cold run completed in a single scale-up/scale-down cycle — no mid-inference
+kill. The old 15-minute idle wait before scale-down is eliminated; cooldown is
+now ~3 min. Cold start + cooldown dominate the billable window for a
+single-request cold run (100% idle fraction), so batching requests within the
+billable window is the main lever for cost efficiency.
 
 ## Weights persistence
 The packaged pipeline (`model.tar.gz`, ~13.3 GB compressed: TRELLIS.2-4B +

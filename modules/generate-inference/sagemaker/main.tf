@@ -64,7 +64,8 @@ resource "random_id" "endpoint_config" {
     # Rotate the endpoint config (blue/green update) when the model environment
     # changes — SageMaker Models are immutable, so a new Model alone does NOT
     # update the running Endpoint; a new EndpointConfig + Endpoint update does.
-    environment = jsonencode(aws_sagemaker_model.this.primary_container[0].environment)
+    environment   = jsonencode(aws_sagemaker_model.this.primary_container[0].environment)
+    instance_type = var.instance_type
   }
 }
 
@@ -88,8 +89,8 @@ resource "aws_sagemaker_model" "this" {
     }
 
     environment = {
-      HF_HOME         = "/opt/ml/model"
-      HF_HUB_OFFLINE  = "1"
+      HF_HOME        = "/opt/ml/model"
+      HF_HUB_OFFLINE = "1"
     }
   }
 }
@@ -100,7 +101,7 @@ resource "aws_sagemaker_endpoint_configuration" "this" {
   production_variants {
     variant_name           = local.variant_name
     model_name             = aws_sagemaker_model.this.name
-    instance_type          = "ml.g6e.2xlarge"
+    instance_type          = var.instance_type
     initial_instance_count = 1
     initial_variant_weight = 1
     # The packaged weights (~16 GB) take time to download at provisioning.
@@ -231,6 +232,18 @@ data "aws_iam_policy_document" "callback" {
   }
 }
 
+data "aws_iam_policy_document" "scaler" {
+  statement {
+    actions   = ["dynamodb:Query"]
+    resources = ["${var.tasks_table_arn}/index/gsi2"]
+  }
+
+  statement {
+    actions   = ["cloudwatch:PutMetricData"]
+    resources = ["*"]
+  }
+}
+
 module "callback" {
   source = "../../lambda-function"
 
@@ -247,6 +260,42 @@ module "callback" {
     SAGEMAKER_OUTPUT_BUCKET = var.output_bucket_name
     POSTPROCESS_MODE        = var.postprocess_mode
   }
+}
+
+module "endpoint_scaler" {
+  source = "../../lambda-function"
+
+  function_name = "${var.name_prefix}-inference-sagemaker-scaler"
+  dist_dir      = "${var.dist_dir}/endpoint-scaler"
+  timeout       = 30
+  memory_size   = 128
+  policy_json   = data.aws_iam_policy_document.scaler.json
+  attach_policy = true
+
+  environment = {
+    TASKS_TABLE   = var.tasks_table_name
+    ENDPOINT_NAME = aws_sagemaker_endpoint.this.name
+  }
+}
+
+resource "aws_cloudwatch_event_rule" "scaler" {
+  name                = "${var.name_prefix}-sagemaker-scaler"
+  schedule_expression = "rate(1 minute)"
+  state               = "ENABLED"
+}
+
+resource "aws_cloudwatch_event_target" "scaler" {
+  rule      = aws_cloudwatch_event_rule.scaler.name
+  target_id = "endpoint-scaler"
+  arn       = module.endpoint_scaler.arn
+}
+
+resource "aws_lambda_permission" "eventbridge_scaler" {
+  statement_id  = "AllowEventBridgeInvoke"
+  action        = "lambda:InvokeFunction"
+  principal     = "events.amazonaws.com"
+  source_arn    = aws_cloudwatch_event_rule.scaler.arn
+  function_name = module.endpoint_scaler.function_name
 }
 
 resource "aws_sns_topic_subscription" "success" {
@@ -353,21 +402,20 @@ resource "aws_appautoscaling_policy" "scale_down" {
   }
 }
 
-resource "aws_cloudwatch_metric_alarm" "no_backlog" {
-  alarm_name          = "${var.name_prefix}-sagemaker-no-backlog"
-  alarm_description   = "Scale in the SageMaker async endpoint when no requests are queued."
-  namespace           = "AWS/SageMaker"
-  metric_name         = "HasBacklogWithoutCapacity"
-  statistic           = "Average"
+resource "aws_cloudwatch_metric_alarm" "scale_to_zero" {
+  alarm_name          = "${var.name_prefix}-sagemaker-scale-to-zero"
+  alarm_description   = "Scale the SageMaker async endpoint to zero when idle (no active invocations for 3 minutes). Replaces the broken HasBacklogWithoutCapacity alarm that fired mid-inference."
+  namespace           = "EverythingStudios/SageMaker"
+  metric_name         = "EndpointIdle"
+  statistic           = "Maximum"
   period              = 60
   evaluation_periods  = 3
   threshold           = 1
-  comparison_operator = "LessThanThreshold"
-  # Missing data = no backlog reported = should scale in. "notBreaching"
-  # would keep the instance alive forever (the metric is absent when idle).
-  treat_missing_data  = "breaching"
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  # If the scaler Lambda stops publishing, scale down as a safety measure
+  # rather than keeping the instance alive forever.
+  treat_missing_data = "breaching"
 
-  # HasBacklogWithoutCapacity reports with EndpointName only (no VariantName).
   dimensions = {
     EndpointName = aws_sagemaker_endpoint.this.name
   }

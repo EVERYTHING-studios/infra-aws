@@ -108,6 +108,9 @@ async function handleSuccess(
       output: JSON.stringify({ task_id: taskId, postprocess }),
     }),
   );
+  // Token is cleared AFTER SendTaskSuccess so SNS retries can still recover it
+  // if the SFN call throws. Once SendTaskSuccess succeeds, the token is unneeded.
+  await updateTask(taskId, { remove: ['sagemaker_task_token'] });
 }
 
 async function handleFailure(
@@ -130,6 +133,7 @@ async function handleFailure(
   }
   console.error(`Task ${taskId} inference failed: ${cause}`);
   await fail(taskToken, 'InferenceFailed', cause);
+  await updateTask(taskId, { remove: ['sagemaker_task_token'] });
 }
 
 async function fail(taskToken: string, error: string, cause: string): Promise<void> {

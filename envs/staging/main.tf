@@ -120,6 +120,7 @@ module "inference" {
   work_bucket_arn   = aws_s3_bucket.work.arn
   inference_backend = var.inference_backend
   postprocess_mode  = var.postprocess_mode
+  instance_type     = var.instance_type
 }
 
 module "pipeline" {

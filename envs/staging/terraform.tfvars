@@ -11,3 +11,8 @@ cloudfront_distribution_id = ""
 # Inference state to .waitForTaskToken. Keep "stub" until staging is validated.
 inference_backend = "sagemaker"
 postprocess_mode  = "lite"
+
+# SageMaker instance type: staging experiments with ml.g5.2xlarge (A10G, 24 GB
+# VRAM) to validate capacity/cost vs the ml.g6e.2xlarge (L40S) default used in
+# production. Remove this line to fall back to g6e.
+instance_type = "ml.g5.2xlarge"

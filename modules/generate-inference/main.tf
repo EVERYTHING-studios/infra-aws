@@ -273,9 +273,9 @@ locals {
 }
 
 module "sagemaker" {
-  count       = var.inference_backend == "sagemaker" ? 1 : 0
-  source      = "./sagemaker"
-  depends_on  = [aws_iam_role_policy.sagemaker_execution]
+  count      = var.inference_backend == "sagemaker" ? 1 : 0
+  source     = "./sagemaker"
+  depends_on = [aws_iam_role_policy.sagemaker_execution]
 
   name_prefix        = var.name_prefix
   env                = var.env
@@ -291,4 +291,5 @@ module "sagemaker" {
   dist_dir           = var.dist_dir
   state_machine_arn  = local.pipeline_state_machine_arn
   postprocess_mode   = var.postprocess_mode
+  instance_type      = var.instance_type
 }

@@ -79,14 +79,16 @@ export interface TaskUpdate {
   inference_backend?: string;
   sagemaker_task_token?: string;
   finished_at?: string;
+  remove?: string[];
 }
 
 export async function updateTask(taskId: string, update: TaskUpdate): Promise<TaskRecord> {
   const now = new Date().toISOString();
-  const fields: Record<string, unknown> = { ...update, updated_at: now };
-  if (update.status) {
+  const { remove: removeFields, ...updateFields } = update;
+  const fields: Record<string, unknown> = { ...updateFields, updated_at: now };
+  if (updateFields.status) {
     // Keep the status GSI in sync.
-    fields.gsi2pk = `STATUS#${update.status}`;
+    fields.gsi2pk = `STATUS#${updateFields.status}`;
   }
 
   const names: Record<string, string> = {};
@@ -99,11 +101,24 @@ export async function updateTask(taskId: string, update: TaskUpdate): Promise<Ta
     sets.push(`#${key} = :${key}`);
   }
 
+  const removes: string[] = [];
+  if (removeFields) {
+    for (const key of removeFields) {
+      names[`#${key}`] = key;
+      removes.push(`#${key}`);
+    }
+  }
+
+  let updateExpression = `SET ${sets.join(', ')}`;
+  if (removes.length > 0) {
+    updateExpression += ` REMOVE ${removes.join(', ')}`;
+  }
+
   const result = await client.send(
     new UpdateCommand({
       TableName: requireEnv('TASKS_TABLE'),
       Key: taskKey(taskId),
-      UpdateExpression: `SET ${sets.join(', ')}`,
+      UpdateExpression: updateExpression,
       ExpressionAttributeNames: names,
       ExpressionAttributeValues: values,
       ConditionExpression: 'attribute_exists(pk)',

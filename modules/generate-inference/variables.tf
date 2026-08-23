@@ -45,3 +45,9 @@ variable "postprocess_mode" {
   type        = string
   default     = "lite"
 }
+
+variable "instance_type" {
+  description = "SageMaker async endpoint instance type. Default ml.g6e.2xlarge (L40S, 45 GB VRAM). Set ml.g5.2xlarge (A10G, 24 GB VRAM) where quota and capacity allow."
+  type        = string
+  default     = "ml.g6e.2xlarge"
+}
