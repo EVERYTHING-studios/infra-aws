@@ -17,7 +17,7 @@ terraform {
   required_providers {
     aws = {
       source  = "hashicorp/aws"
-      version = "~> 5.0"
+      version = "~> 6.0"
     }
     random = {
       source  = "hashicorp/random"
@@ -31,15 +31,27 @@ data "aws_region" "current" {}
 
 locals {
   variant_name = "trellis"
+
+  # Model container environment, tracked by the endpoint_config keepers so a
+  # change rolls a new Model + EndpointConfig (blue/green). Defined as a local
+  # to avoid a circular dependency: random_id keepers must not reference the
+  # model resource whose name derives from random_id.hex.
+  model_environment = {
+    HF_HOME             = "/opt/ml/model"
+    HF_HUB_OFFLINE      = "1"
+    TRELLIS2_LOW_VRAM   = var.low_vram
+    TRELLIS2_EAGER_LOAD = "1"
+  }
 }
 
 # ------------------------------------------------------------------
 # SSM inputs (written out-of-band): ECR image URI and weights model.tar.gz URI.
-# weights_s3_uri is per-env: /trellis2image/{env}/weights/s3_uri (B1 decision 7).
+# image_uri and weights_s3_uri are both per-env: /trellis2image/{env}/{ecr,weights}/...
+# (per-env image_uri avoids staging/prod sharing one SSM value; B1 decision 7).
 # ------------------------------------------------------------------
 
 data "aws_ssm_parameter" "image_uri" {
-  name = "/trellis2image/ecr/image_uri"
+  name = "/trellis2image/${var.env}/ecr/image_uri"
 }
 
 data "aws_ssm_parameter" "weights_s3_uri" {
@@ -64,13 +76,13 @@ resource "random_id" "endpoint_config" {
     # Rotate the endpoint config (blue/green update) when the model environment
     # changes — SageMaker Models are immutable, so a new Model alone does NOT
     # update the running Endpoint; a new EndpointConfig + Endpoint update does.
-    environment   = jsonencode(aws_sagemaker_model.this.primary_container[0].environment)
+    environment   = jsonencode(local.model_environment)
     instance_type = var.instance_type
   }
 }
 
 resource "aws_sagemaker_model" "this" {
-  name               = "${var.name_prefix}-sagemaker-model"
+  name               = "${var.name_prefix}-sagemaker-model-${random_id.endpoint_config.hex}"
   execution_role_arn = var.execution_role_arn
 
   primary_container {
@@ -88,10 +100,11 @@ resource "aws_sagemaker_model" "this" {
       }
     }
 
-    environment = {
-      HF_HOME        = "/opt/ml/model"
-      HF_HUB_OFFLINE = "1"
-    }
+    environment = local.model_environment
+  }
+
+  lifecycle {
+    create_before_destroy = true
   }
 }
 

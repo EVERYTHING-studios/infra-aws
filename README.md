@@ -160,7 +160,7 @@ adding the `generate-inference/sagemaker` submodule:
 - **Model**: TRELLIS.2-4B (`microsoft/TRELLIS.2-4B`) is the chosen model. The inference image
   is in ECR as `trellis2image:c374e66-serve-fix`
   (`095256591532.dkr.ecr.us-east-1.amazonaws.com/trellis2image:c374e66-serve-fix`), and the SSM params
-  `/trellis2image/ecr/repository_uri` and `/trellis2image/ecr/image_uri` are written.
+  `/trellis2image/ecr/repository_uri` and `/trellis2image/{env}/ecr/image_uri` are written.
 - **SageMaker async inference** endpoints: S3 in/out, SNS success/error topics → callback
   Lambda → `SendTaskSuccess` (the state machine's inference state becomes `.waitForTaskToken`).
   The container returns GLB bytes directly from `/invocations`; SageMaker writes them to the

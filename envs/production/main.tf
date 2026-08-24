@@ -4,7 +4,7 @@ terraform {
   required_providers {
     aws = {
       source  = "hashicorp/aws"
-      version = "~> 5.0"
+      version = "~> 6.0"
     }
     archive = {
       source  = "hashicorp/archive"
@@ -120,6 +120,8 @@ module "inference" {
   work_bucket_arn   = aws_s3_bucket.work.arn
   inference_backend = var.inference_backend
   postprocess_mode  = var.postprocess_mode
+  instance_type     = var.instance_type
+  low_vram          = var.low_vram
 }
 
 module "pipeline" {

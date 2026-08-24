@@ -11,7 +11,7 @@ keeping the same pipeline contract:
 
 TRELLIS.2-4B (`microsoft/TRELLIS.2-4B`) is the chosen model. Image:
 `095256591532.dkr.ecr.us-east-1.amazonaws.com/trellis2image:c374e66-serve-fix` (SSM
-`/trellis2image/ecr/image_uri`). The full SSM/IAM/resource contract is in
+`/trellis2image/{env}/ecr/image_uri`). The full SSM/IAM/resource contract is in
 `trellis2image/docs/sagemaker-iac-contract.md`; instance sizing is in
 `trellis2image/docs/instance-sizing.md`.
 
@@ -115,16 +115,17 @@ single-request cold run (100% idle fraction), so batching requests within the
 billable window is the main lever for cost efficiency.
 
 ## Weights persistence
-The packaged pipeline (`model.tar.gz`, ~13.3 GB compressed: TRELLIS.2-4B +
-DINOv3 + BiRefNet) is downloaded to `/opt/ml/model` at endpoint provisioning.
-The tar is built with `--dereference` to resolve HuggingFace cache symlinks
-(`snapshots/` → `blobs/`); SageMaker rejects tar archives containing symlinks.
-`ModelDataSource.S3DataSource` is used instead of `ModelDataUrl` (which has a
-~5 GB extraction limit). The container sets `HF_HOME=/opt/ml/model` so
-HuggingFace loads from the local cache with no network fetch at serve time.
-`model_data_download_timeout_in_seconds = 3600` (on `production_variants`)
-accommodates the large download; `container_startup_health_check_timeout_in_seconds
-= 600` covers the ~14 GB GPU weights load at container startup.
+The packaged pipeline (`model.tar.gz`, ~10.8 GB compressed: TRELLIS.2-4B +
+DINOv3 + BiRefNet, with the unused `tex_slat_flow_model_512` excluded) is
+downloaded to `/opt/ml/model` at endpoint provisioning. The tar is built with
+`--dereference` to resolve HuggingFace cache symlinks (`snapshots/` → `blobs/`);
+SageMaker rejects tar archives containing symlinks. `ModelDataSource.S3DataSource`
+is used instead of `ModelDataUrl` (which has a ~5 GB extraction limit). The
+container sets `HF_HOME=/opt/ml/model` so HuggingFace loads from the local cache
+with no network fetch at serve time. `model_data_download_timeout_in_seconds =
+3600` (on `production_variants`) accommodates the large download;
+`container_startup_health_check_timeout_in_seconds = 600` covers the ~14 GB GPU
+weights load at container startup (eager-loaded before `/ping` returns 200).
 
 ## Async output contract
 
@@ -136,14 +137,29 @@ reads the GLB from the output bucket.
 
 ## Instances
 
-`ml.g6e.2xlarge` (current steady-state instance; L40S GPU, 45 GB VRAM, 8 vCPU,
-64 GiB RAM). `ml.g5.2xlarge` (A10G, 24 GB VRAM) was the target but had
-account endpoint-quota=0; `ml.g5.xlarge` had `InsufficientInstanceCapacity`.
-The image's `TORCH_CUDA_ARCH_LIST="8.0;8.6;9.0;12.0+PTX"` covers the L40S
-(sm_89) via PTX forward-compat from sm_90 — no rebuild was needed. If the
-g5.2xlarge quota increase is approved later, the instance can flip back.
-Multi-GPU instances (g5.12x+, p4d, p5) waste all but one GPU on this
-single-GPU-per-render workload — see `trellis2image/docs/instance-sizing.md`.
+`ml.g7e.2xlarge` (Blackwell RTX PRO 6000, 96 GB VRAM, 1,597 GB/s memory
+bandwidth, 8 vCPU, 64 GiB RAM) is the primary instance. The image is compiled
+for sm_120 only (`TORCH_CUDA_ARCH_LIST="12.0+PTX"`); to fall back to g6e/g5,
+build a multi-arch image (`TORCH_CUDA_ARCH_LIST="8.0;8.6;9.0;12.0+PTX"
+./scripts/build_image.sh trellis2image:multiarch`) and set `instance_type` in
+the env tfvars. `ml.g6e.2xlarge` (L40S, 45 GB) is the fallback; `ml.g5.2xlarge`
+(A10G, 24 GB) is the budget option but requires `low_vram = "1"` (its 24 GB
+VRAM cannot hold all ~17 GB of models resident). Multi-GPU instances (g5.12x+,
+p4d, p5) waste all but one GPU on this single-GPU-per-render workload — see
+`trellis2image/docs/instance-sizing.md`.
+
+The container environment sets:
+- `TRELLIS2_LOW_VRAM` — forwarded from the `low_vram` Terraform variable
+  (default `"0"`). `"0"` loads all ~17 GB models to GPU once at startup (no
+  per-request PCIe swapping); requires ≥45 GB VRAM (g6e/g7e). `"1"` keeps models
+  on CPU and swaps per-stage (safe on g5 24 GB).
+- `TRELLIS2_EAGER_LOAD = "1"` — loads the pipeline at container startup (before
+  `/ping` returns 200) so the first request gets warm-speed latency and load
+  failures surface during endpoint creation.
+- `TRELLIS2_SKIP_UNUSED_MODELS` — defaults to `"1"` (set in the image, not TF):
+  drops the unused `tex_slat_flow_model_512` (~2.5 GB) from the loaded model
+  set. The default `1024_cascade` pipeline never references it.
+
 The `serve` entrypoint script (`serving/serve`, symlinked to
 `/usr/local/bin/serve`) satisfies the NVIDIA base image's `exec serve`
 convention used by SageMaker.

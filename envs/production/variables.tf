@@ -25,3 +25,15 @@ variable "postprocess_mode" {
   type        = string
   default     = "lite"
 }
+
+variable "instance_type" {
+  description = "SageMaker async endpoint instance type. Default ml.g7e.2xlarge (Blackwell RTX PRO 6000, 96 GB VRAM, 1597 GB/s). g6e.2xlarge (L40S, 45 GB) is the fallback; g5.2xlarge (A10G, 24 GB) requires low_vram=\"1\"."
+  type        = string
+  default     = "ml.g7e.2xlarge"
+}
+
+variable "low_vram" {
+  description = "TRELLIS2_LOW_VRAM env: \"0\" (default) loads all models to GPU once (requires >=45 GB VRAM); \"1\" keeps models on CPU per-stage (safe on g5 24 GB)."
+  type        = string
+  default     = "0"
+}

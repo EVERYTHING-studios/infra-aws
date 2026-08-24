@@ -15,7 +15,7 @@ terraform {
   required_providers {
     aws = {
       source  = "hashicorp/aws"
-      version = "~> 5.0"
+      version = "~> 6.0"
     }
   }
 }
@@ -292,4 +292,5 @@ module "sagemaker" {
   state_machine_arn  = local.pipeline_state_machine_arn
   postprocess_mode   = var.postprocess_mode
   instance_type      = var.instance_type
+  low_vram           = var.low_vram
 }
