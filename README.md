@@ -193,7 +193,7 @@ All three phases are ✅ DONE in staging:
 
 ## Conventions
 
-- Terraform ≥ 1.10 (native S3 state locking via `use_lockfile`), AWS provider `~> 5.x`, `us-east-1`.
+- Terraform ≥ 1.10 (native S3 state locking via `use_lockfile`), AWS provider `~> 6.0`, `us-east-1`.
 - Environments are directories (`envs/staging`, `envs/production`) with separate state
   keys in `s3://everything-infra-tfstate-095256591532` — no workspaces.
 - Naming is verb-based (`generate-*`), never vendor-based.
