@@ -37,10 +37,11 @@ locals {
   # to avoid a circular dependency: random_id keepers must not reference the
   # model resource whose name derives from random_id.hex.
   model_environment = {
-    HF_HOME             = "/opt/ml/model"
-    HF_HUB_OFFLINE      = "1"
-    TRELLIS2_LOW_VRAM   = var.low_vram
-    TRELLIS2_EAGER_LOAD = "1"
+    HF_HOME                = "/opt/ml/model"
+    HF_HUB_OFFLINE         = "1"
+    TRELLIS2_LOW_VRAM      = var.low_vram
+    TRELLIS2_EAGER_LOAD    = "1"
+    TRELLIS2_PIPELINE_TYPE = "1024"
   }
 }
 
