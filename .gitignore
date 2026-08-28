@@ -9,7 +9,9 @@ crash.log
 # Lambda build output
 services/generate/dist/
 services/generate/node_modules/
-*.zip
+/node_modules/
+/package-lock.json
+/package.json
 
 # Local env
 .env

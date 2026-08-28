@@ -1,5 +1,6 @@
-# Public HTTP API for the generate service: custom domain, Lambda authorizer
-# (x-api-key against Secrets Manager), and the task CRUD handlers.
+# Generate API routes: Lambda authorizer (x-api-key against Secrets Manager)
+# and task CRUD handlers. The HTTP API Gateway itself is owned by the
+# shared api-gateway module.
 
 terraform {
   required_version = ">= 1.10"
@@ -143,27 +144,11 @@ module "health" {
 }
 
 # ------------------------------------------------------------------
-# HTTP API
+# Routes (attached to the shared api-gateway module)
 # ------------------------------------------------------------------
 
-resource "aws_apigatewayv2_api" "this" {
-  name          = var.name_prefix
-  protocol_type = "HTTP"
-}
-
-resource "aws_apigatewayv2_stage" "default" {
-  api_id      = aws_apigatewayv2_api.this.id
-  name        = "$default"
-  auto_deploy = true
-
-  default_route_settings {
-    throttling_burst_limit = 100
-    throttling_rate_limit  = 50
-  }
-}
-
 resource "aws_apigatewayv2_authorizer" "api_key" {
-  api_id                            = aws_apigatewayv2_api.this.id
+  api_id                            = var.api_id
   name                              = "api-key"
   authorizer_type                   = "REQUEST"
   authorizer_uri                    = module.authorizer.invoke_arn
@@ -178,24 +163,24 @@ resource "aws_lambda_permission" "authorizer" {
   action        = "lambda:InvokeFunction"
   function_name = module.authorizer.function_name
   principal     = "apigateway.amazonaws.com"
-  source_arn    = "${aws_apigatewayv2_api.this.execution_arn}/authorizers/${aws_apigatewayv2_authorizer.api_key.id}"
+  source_arn    = "${var.api_execution_arn}/authorizers/${aws_apigatewayv2_authorizer.api_key.id}"
 }
 
 locals {
   routes = {
-    "POST /v1/tasks" = {
+    "POST /v1/generate/tasks" = {
       lambda     = module.create_task
       authorized = true
     }
-    "GET /v1/tasks/{id}" = {
+    "GET /v1/generate/tasks/{id}" = {
       lambda     = module.get_task
       authorized = true
     }
-    "POST /v1/tasks/{id}/cancel" = {
+    "POST /v1/generate/tasks/{id}/cancel" = {
       lambda     = module.cancel_task
       authorized = true
     }
-    "GET /v1/health" = {
+    "GET /v1/generate/health" = {
       lambda     = module.health
       authorized = false
     }
@@ -205,7 +190,7 @@ locals {
 resource "aws_apigatewayv2_integration" "routes" {
   for_each = local.routes
 
-  api_id                 = aws_apigatewayv2_api.this.id
+  api_id                 = var.api_id
   integration_type       = "AWS_PROXY"
   integration_uri        = each.value.lambda.invoke_arn
   payload_format_version = "2.0"
@@ -214,7 +199,7 @@ resource "aws_apigatewayv2_integration" "routes" {
 resource "aws_apigatewayv2_route" "routes" {
   for_each = local.routes
 
-  api_id             = aws_apigatewayv2_api.this.id
+  api_id             = var.api_id
   route_key          = each.key
   target             = "integrations/${aws_apigatewayv2_integration.routes[each.key].id}"
   authorization_type = each.value.authorized ? "CUSTOM" : "NONE"
@@ -228,37 +213,5 @@ resource "aws_lambda_permission" "routes" {
   action        = "lambda:InvokeFunction"
   function_name = each.value.lambda.function_name
   principal     = "apigateway.amazonaws.com"
-  source_arn    = "${aws_apigatewayv2_api.this.execution_arn}/*/*"
-}
-
-# ------------------------------------------------------------------
-# Custom domain
-# ------------------------------------------------------------------
-
-resource "aws_apigatewayv2_domain_name" "this" {
-  domain_name = var.domain_name
-
-  domain_name_configuration {
-    certificate_arn = var.certificate_arn
-    endpoint_type   = "REGIONAL"
-    security_policy = "TLS_1_2"
-  }
-}
-
-resource "aws_apigatewayv2_api_mapping" "this" {
-  api_id      = aws_apigatewayv2_api.this.id
-  domain_name = aws_apigatewayv2_domain_name.this.id
-  stage       = aws_apigatewayv2_stage.default.id
-}
-
-resource "aws_route53_record" "this" {
-  zone_id = var.hosted_zone_id
-  name    = var.domain_name
-  type    = "A"
-
-  alias {
-    name                   = aws_apigatewayv2_domain_name.this.domain_name_configuration[0].target_domain_name
-    zone_id                = aws_apigatewayv2_domain_name.this.domain_name_configuration[0].hosted_zone_id
-    evaluate_target_health = false
-  }
+  source_arn    = "${var.api_execution_arn}/*/*"
 }

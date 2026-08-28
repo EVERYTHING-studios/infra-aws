@@ -70,6 +70,11 @@ data "aws_iam_policy_document" "prepare" {
     actions   = ["s3:PutObject"]
     resources = ["${var.work_bucket_arn}/*"]
   }
+
+  statement {
+    actions   = ["sqs:SendMessage"]
+    resources = [aws_sqs_queue.webhook.arn]
+  }
 }
 
 module "prepare" {
@@ -86,7 +91,8 @@ module "prepare" {
     TASKS_TABLE       = var.tasks_table_name
     WORK_BUCKET       = var.work_bucket_name
     INFERENCE_BACKEND = var.inference_backend
-    POSTPROCESS_MODE  = var.postprocess_mode
+    POSTPROCESS_MODE   = var.postprocess_mode
+    WEBHOOK_QUEUE_URL  = aws_sqs_queue.webhook.url
   }
 }
 

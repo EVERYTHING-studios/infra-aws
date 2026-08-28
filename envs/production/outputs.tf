@@ -1,5 +1,5 @@
 output "api_url" {
-  value = module.api.api_url
+  value = module.api_gateway.api_url
 }
 
 output "state_machine_arn" {

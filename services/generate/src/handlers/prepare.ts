@@ -1,5 +1,5 @@
 import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3';
-import { getTask, updateTask } from '../lib/tasks-repo.js';
+import { enqueueWebhook } from '../lib/webhook-queue.js';
 import { requireEnv } from '../lib/env.js';
 
 const s3 = new S3Client({});
@@ -47,12 +47,13 @@ export async function handler(event: PrepareInput): Promise<PipelineContext> {
     );
   }
 
-  await updateTask(task.task_id, {
+  const updated = await updateTask(task.task_id, {
     status: 'IN_PROGRESS',
     progress: 5,
     artifact_prefix: artifactPrefix,
     inference_backend: process.env.INFERENCE_BACKEND ?? 'stub',
   });
+  await enqueueWebhook(updated);
 
   return {
     task_id: task.task_id,

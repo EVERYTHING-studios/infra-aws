@@ -8,18 +8,13 @@ variable "dist_dir" {
   type        = string
 }
 
-variable "domain_name" {
-  description = "Custom domain (e.g. staging-generate.everythingstudios.ai)."
+variable "api_id" {
+  description = "ID of the shared API Gateway (from the api-gateway module)."
   type        = string
 }
 
-variable "hosted_zone_id" {
-  description = "Route53 hosted zone for the domain."
-  type        = string
-}
-
-variable "certificate_arn" {
-  description = "ACM certificate covering the domain (regional, us-east-1)."
+variable "api_execution_arn" {
+  description = "Execution ARN of the shared API Gateway."
   type        = string
 }
 

@@ -33,7 +33,7 @@ locals {
   name_prefix = "generate-${local.env}"
   dist_dir    = "${path.module}/../../services/generate/dist"
 
-  domain_name     = "generate.everythingstudios.ai"
+  api_domain_name = "api.everythingstudios.ai"
   assets_base_url = "https://assets.everythingstudios.ai"
   webhook_url     = "https://everythingstudios.ai/api/generate/webhook"
 
@@ -147,14 +147,21 @@ module "pipeline" {
   subnet_ids                 = var.subnet_ids
 }
 
+module "api_gateway" {
+  source          = "../../modules/api-gateway"
+  name_prefix     = "everything-api-${local.env}"
+  domain_name     = local.api_domain_name
+  hosted_zone_id  = local.hosted_zone_id
+  certificate_arn = local.certificate_arn
+}
+
 module "api" {
   source = "../../modules/generate-api"
 
   name_prefix        = local.name_prefix
   dist_dir           = local.dist_dir
-  domain_name        = local.domain_name
-  hosted_zone_id     = local.hosted_zone_id
-  certificate_arn    = local.certificate_arn
+  api_id             = module.api_gateway.api_id
+  api_execution_arn  = module.api_gateway.api_execution_arn
   api_key_secret_arn = aws_secretsmanager_secret.api_key.arn
   tasks_table_name   = module.tasks.table_name
   tasks_table_arn    = module.tasks.table_arn

@@ -1,7 +1,8 @@
 # infra-aws
 
 Infrastructure-as-code for EVERYTHING Studios' AWS services, starting with
-**generate** — the in-house 3D generation service that replaces Meshy.ai.
+**generate** — an in-house 3D generation service available alongside Meshy.ai
+(the web-app exposes a provider selector).
 
 ## Applying to a single environment
 
@@ -35,8 +36,8 @@ infra-aws/
 ├── bootstrap/               # One-time account setup: TF state bucket + GitHub OIDC CI roles
 ├── modules/
 │   ├── lambda-function/     # Internal helper: zip + deploy one TypeScript Lambda
-│   ├── generate-api/        # HTTP API Gateway, custom domain, authorizer, task CRUD Lambdas
-│   ├── generate-tasks/      # DynamoDB task table
+│   ├── api-gateway/        # Shared HTTP API Gateway, custom domain, Route53 (for all infra-aws services)
+│   ├── generate-api/        # Authorizer, task CRUD Lambdas, routes (API GW owned by api-gateway)
 │   ├── generate-pipeline/   # Step Functions pipeline, work bucket, webhook dispatcher, Fargate post-process
 │   ├── generate-inference/  # Inference backend (stub Lambda or SageMaker async; SageMaker is live in staging)
 │   └── ci-oidc/             # GitHub Actions OIDC provider (data source) + plan role (used by bootstrap)
@@ -49,12 +50,13 @@ infra-aws/
 
 ## The generate service
 
-`generate` is an async 3D-generation API. The web-app calls it instead of Meshy;
-everything else in the product (Supabase `meshy_jobs` table, S3 `model-assets`
+`generate` is an async 3D-generation API. The web-app calls it alongside Meshy
+(a provider selector in the UI chooses which backend to use); everything else
+in the product (Supabase `generation_jobs` table, S3 `model-assets`
 bucket, CloudFront CDN) stays exactly where it is.
 
 ```
-web-app ──POST /v1/tasks──▶ API GW ──▶ create-task λ ──▶ DynamoDB + Step Functions
+web-app ──POST /v1/generate/tasks──▶ API GW ──▶ create-task λ ──▶ DynamoDB + Step Functions
                                                               │
    Prepare λ ──▶ Inference (stub λ | SageMaker async) ──▶ PostProcess (Fargate Blender | lite λ)
                                                               │
@@ -63,12 +65,17 @@ web-app ──POST /v1/tasks──▶ API GW ──▶ create-task λ ──▶ 
 web-app ◀──HMAC-signed webhook◀── dispatch λ ◀── SQS ◀────────┘
 ```
 
-- **API**: `https://generate.everythingstudios.ai` (prod) / `https://staging-generate.everythingstudios.ai` (staging)
-  - `POST /v1/tasks` → `202 {"task_id": "<ulid>"}`
-  - `GET /v1/tasks/{id}` → status/progress/model_urls (Meshy-compatible status vocabulary)
-  - `POST /v1/tasks/{id}/cancel`
-  - `GET /v1/health` (unauthenticated)
+- **API**: `https://api.everythingstudios.ai` (prod) / `https://staging-api.everythingstudios.ai` (staging)
+  - `POST /v1/generate/tasks` → `202 {"task_id": "<ulid>"}`
+  - `GET /v1/generate/tasks/{id}` → status/progress/model_urls (Meshy-compatible status vocabulary)
+  - `POST /v1/generate/tasks/{id}/cancel`
+  - `GET /v1/generate/health` (unauthenticated)
   - Auth: `x-api-key` header, checked by a Lambda authorizer against Secrets Manager.
+- **Shared API Gateway**: The `modules/api-gateway/` module owns the HTTP API Gateway, custom domain
+  (`api.everythingstudios.ai` / `staging-api.everythingstudios.ai`), and Route53 record. The
+  `generate-api` module connects its routes, authorizer, and Lambda integrations to the shared
+  gateway via `api_id` and `api_execution_arn` inputs. Future infra-aws services will attach to the
+  same gateway.
 - **Outputs** are written directly to the existing `everything-generative-ar-{env}-model-assets`
   bucket at `model-assets/{userId}/{jobId}.glb` / `{jobId}-thumbnail.jpg`, served by the
   existing assets CloudFront distribution. Those buckets are **owned by the web-app's SST
@@ -120,7 +127,7 @@ aws secretsmanager put-secret-value \
 ```
 
 Give the same two values to the web-app as `GENERATE_API_KEY` and `GENERATE_WEBHOOK_SECRET`
-(SST secrets), plus `GENERATE_API_URL=https://staging-generate.everythingstudios.ai`.
+(SST secrets), plus `GENERATE_API_URL=https://staging-api.everythingstudios.ai`.
 
 And push the post-process container (optional until Fargate post-processing is enabled;
 the pipeline defaults to the "lite" Lambda post-process until then):
@@ -137,16 +144,16 @@ Then set `postprocess_mode = "fargate"` in the env's `terraform.tfvars`.
 ## Smoke test (staging, stub backend)
 
 ```bash
-API=https://staging-generate.everythingstudios.ai
+API=https://staging-api.everythingstudios.ai
 KEY=$(aws secretsmanager get-secret-value --secret-id generate-staging-api-key --query SecretString --output text)
 
-TASK=$(curl -s -X POST "$API/v1/tasks" -H "x-api-key: $KEY" -H 'content-type: application/json' -d '{
+TASK=$(curl -s -X POST "$API/v1/generate/tasks" -H "x-api-key: $KEY" -H 'content-type: application/json' -d '{
   "type": "text-to-3d-preview",
   "input": { "prompt": "a small ceramic teapot" },
   "output": { "user_id": "00000000-0000-4000-8000-000000000001", "job_id": "00000000-0000-4000-8000-000000000002" }
 }' | jq -r .task_id)
 
-watch -n 2 "curl -s $API/v1/tasks/$TASK -H 'x-api-key: $KEY' | jq '{status, progress, model_urls}'"
+watch -n 2 "curl -s $API/v1/generate/tasks/$TASK -H 'x-api-key: $KEY" | jq '{status, progress, model_urls}'"
 # → SUCCEEDED with model_urls.glb on the staging assets CDN, and an HMAC-signed
 #   webhook POSTed to the configured webhook_url.
 ```
