@@ -1,11 +1,11 @@
 # Fill in from the account (aws ec2 describe-vpcs / describe-subnets):
-vpc_id     = "vpc-CHANGE-ME"
-subnet_ids = ["subnet-CHANGE-ME-a", "subnet-CHANGE-ME-b"]
+vpc_id     = "vpc-0b1a89926db644682"
+subnet_ids = ["subnet-0b1844d621a18491c", "subnet-0a8f3166ff4354d21", "subnet-0278be3dbed4262c5", "subnet-01851a28b42da9179", "subnet-01779a892bf7c9e0d", "subnet-0e43f0cde99e9f7a4"]
 
 # From the web-app SST stack (AssetsCdn distribution):
 cloudfront_distribution_id = ""
 
-inference_backend = "stub"
+inference_backend = "sagemaker"
 postprocess_mode  = "lite"
 
 # SageMaker instance type: ml.g7e.2xlarge (Blackwell RTX PRO 6000, 96 GB VRAM,
@@ -15,3 +15,7 @@ postprocess_mode  = "lite"
 # low_vram="0" loads all ~17 GB models to GPU once (safe on 96 GB VRAM).
 instance_type = "ml.g7e.2xlarge"
 low_vram      = "0"
+
+# Endpoint autoscaling max. Quota L-5AA715AC is per-region and now 4 in
+# us-east-1; staging 1 + production 1 fits comfortably.
+sagemaker_max_capacity = 1

@@ -161,42 +161,74 @@ watch -n 2 "curl -s $API/v1/generate/tasks/$TASK -H 'x-api-key: $KEY" | jq '{sta
 ## SageMaker inference backend
 
 The real model swaps in behind the same pipeline contract (work-bucket input prefix in,
-GLB at `tasks/{task_id}/raw/model.glb` out) by setting `INFERENCE_BACKEND=sagemaker` and
-adding the `generate-inference/sagemaker` submodule:
+GLB at `tasks/{task_id}/raw/model.glb` out) by setting `INFERENCE_BACKEND=sagemaker`. The
+backend is **multi-region**: the full regional stack is deployed once per candidate region,
+and a capacity sentinel elects the active region from live evidence.
 
 - **Model**: TRELLIS.2-4B (`microsoft/TRELLIS.2-4B`) is the chosen model. The inference image
   is in ECR as `trellis2image:c374e66-serve-fix`
   (`095256591532.dkr.ecr.us-east-1.amazonaws.com/trellis2image:c374e66-serve-fix`), and the SSM params
   `/trellis2image/ecr/repository_uri` and `/trellis2image/{env}/ecr/image_uri` are written.
+- **Regional stacks** (`modules/generate-inference/sagemaker-region/`): one instance per
+  candidate region — us-east-1, us-east-2, us-west-2, the only regions where SageMaker offers
+  `ml.g7e.2xlarge` — each with its own provider alias (`aws.useast2`/`aws.uswest2`), S3
+  input/output/weights buckets (us-east-1 keeps the legacy names; alternates gain
+  `-useast2`/`-uswest2` suffixes), Model, EndpointConfig, Endpoint, SNS topics, and
+  scale-to-zero autoscaling. A 0-instance endpoint is free, so idle candidate regions cost
+  ~nothing (weights bucket + ECR image storage only).
+- **Control plane + election** (`modules/generate-inference/sagemaker-control/`): the
+  dispatcher/callback/scaler Lambdas plus a capacity-sentinel Lambda, all in us-east-1. AWS
+  exposes no capacity-availability API, so the sentinel (EventBridge `rate(1 minute)`)
+  classifies every candidate region FAILED / DROUGHT / PROVISIONING / HEALTHY from
+  describe-endpoint + scaling-activity evidence and flips the `active_region` SSM parameter
+  (`/generate/{env}/sagemaker/active_region`) with a 300 s cooldown. The dispatcher reads it
+  and stages input + invokes in the active region; failback to a higher-priority region
+  happens only once that region is healthy-PROVEN; tasks stranded in an abandoned region are
+  re-dispatched automatically. See the module READMEs for the full election rules.
 - **SageMaker async inference** endpoints: S3 in/out, SNS success/error topics → callback
   Lambda → `SendTaskSuccess` (the state machine's inference state becomes `.waitForTaskToken`).
   The container returns GLB bytes directly from `/invocations`; SageMaker writes them to the
   configured `S3OutputPath` — the container does **not** write to S3 itself.
 - **Scale-to-zero**: autoscaling on `HasBacklogWithoutCapacity`, `MinCapacity = 0`,
-  `MaxCapacity = 2` — multi-minute cold starts are fine for an async pipeline.
-- **Instances**: `ml.g6e.2xlarge` (L40S, 45 GB VRAM, 8 vCPU, 64 GiB RAM) — the current
-  steady-state instance. `ml.g5.2xlarge` (A10G, 24 GB) was the target but had endpoint-quota=0;
-  `ml.g5.xlarge` had `InsufficientInstanceCapacity`. If the g5.2xlarge quota increase is approved,
-  the instance can flip back. Multi-GPU instances (g5.12x+, p4d, p5) waste all but one GPU on
-  this single-GPU-per-render workload. See `trellis2image/docs/instance-sizing.md`.
+  `MaxCapacity = 2` — multi-minute cold starts are fine for an async pipeline, in every
+  candidate region.
+- **Instances**: `ml.g7e.2xlarge` (Blackwell RTX PRO 6000, 96 GB VRAM, 1,597 GB/s memory
+  bandwidth) is the primary instance — 5.1× faster and 3.4× cheaper per request than the g6e
+  fallback, and the image is compiled for sm_120 only. `ml.g6e.2xlarge` (L40S, 45 GB) is the
+  fallback and needs a multi-arch image build; `ml.g5.2xlarge` (A10G, 24 GB) is the budget
+  option but requires `low_vram = "1"`. Multi-GPU instances (g5.12x+, p4d, p5) waste all but
+  one GPU on this single-GPU-per-render workload. See
+  `trellis2image/docs/instance-sizing.md`.
 - **Contract**: the precise SSM parameter handoff, IAM, and resource list is in
-  `trellis2image/docs/sagemaker-iac-contract.md` (this repo is app-only; Terraform lives here).
+  `trellis2image/docs/sagemaker-iac-contract.md` (this repo is app-only; Terraform lives
+  here) — including the **add-a-region runbook** (quota approval → targeted bucket apply →
+  `replicate_artifacts.sh` → full apply → automatic election).
 
 ### Deployed
 
-All three phases are ✅ DONE in staging:
+The SageMaker backend is live in staging:
 
-- **Phase 1** ✅: S3 buckets (weights, input, output), SSM phase-1 params, SageMaker execution
+- **Phase 1**: S3 buckets (weights, input, output), SSM phase-1 params, SageMaker execution
   role (with `s3:ListBucket`+`s3:PutObject` on output bucket, `sns:Publish` on SNS topics).
-- **Phase 2** ✅: TRELLIS.2 pipeline weights packaged as `model.tar.gz` (~13.3 GB, symlink-free
+- **Phase 2**: TRELLIS.2 pipeline weights packaged as `model.tar.gz` (~13.3 GB, symlink-free
   via `--dereference`) and uploaded to the weights bucket.
-- **Phase 3** ✅: SageMaker Model (`ModelDataSource.S3DataSource`, not `ModelDataUrl`),
-  EndpointConfig (`ml.g6e.2xlarge`, `container_startup_health_check_timeout = 600`),
-  Endpoint (InService), autoscaling (min=0/max=2, `ChangeInCapacity` step scaling), dispatcher
+- **Phase 3**: SageMaker Model (`ModelDataSource.S3DataSource`, not `ModelDataUrl`),
+  EndpointConfig (`ml.g7e.2xlarge`, `container_startup_health_check_timeout = 600`),
+  Endpoint, autoscaling (min=0/max=2, `ChangeInCapacity` step scaling), dispatcher
   + callback Lambdas, state machine `.waitForTaskToken` wiring.
+- **Multi-region refactor** (applied to staging 2026-09-17): the single `sagemaker/`
+  submodule was split into `sagemaker-region/` (per-candidate-region stack) +
+  `sagemaker-control/` (us-east-1 control plane with the sentinel); staging currently runs
+  with `sagemaker_candidate_regions = ["us-east-1"]`.
 
-**Remaining:** e2e verification (submit a test task via the staging API) and production cutover
-(after staging is validated).
+**Remaining**: quota approvals (`L-5AA715AC`) in us-east-2/us-west-2, then the add-a-region
+runbook per candidate as each lands; and the production migration below.
+
+**Production warning**: `envs/production` still uses the old module layout in its Terraform
+state. It must NOT be planned or applied until it gets the same refactor — aliased providers
+plus the identical `terraform state mv` surgery staging received. Until then Terraform fails
+loudly on the missing provider configuration aliases; that is intentional, a fail-safe
+against an accidental destroy.
 
 ## Conventions
 

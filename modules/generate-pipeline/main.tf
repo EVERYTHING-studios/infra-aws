@@ -91,8 +91,8 @@ module "prepare" {
     TASKS_TABLE       = var.tasks_table_name
     WORK_BUCKET       = var.work_bucket_name
     INFERENCE_BACKEND = var.inference_backend
-    POSTPROCESS_MODE   = var.postprocess_mode
-    WEBHOOK_QUEUE_URL  = aws_sqs_queue.webhook.url
+    POSTPROCESS_MODE  = var.postprocess_mode
+    WEBHOOK_QUEUE_URL = aws_sqs_queue.webhook.url
   }
 }
 
@@ -193,6 +193,58 @@ module "fail_task" {
     TASKS_TABLE       = var.tasks_table_name
     WEBHOOK_QUEUE_URL = aws_sqs_queue.webhook.url
   }
+}
+
+data "aws_iam_policy_document" "execution_status_watch" {
+  statement {
+    actions   = ["dynamodb:GetItem", "dynamodb:UpdateItem"]
+    resources = [var.tasks_table_arn]
+  }
+
+  statement {
+    actions   = ["sqs:SendMessage"]
+    resources = [aws_sqs_queue.webhook.arn]
+  }
+}
+
+module "execution_status_watch" {
+  source        = "../lambda-function"
+  function_name = "${var.name_prefix}-execution-status-watch"
+  dist_dir      = "${var.dist_dir}/execution-status-watch"
+  timeout       = 30
+  policy_json   = data.aws_iam_policy_document.execution_status_watch.json
+  attach_policy = true
+
+  environment = {
+    TASKS_TABLE       = var.tasks_table_name
+    WEBHOOK_QUEUE_URL = aws_sqs_queue.webhook.url
+  }
+}
+
+resource "aws_cloudwatch_event_rule" "execution_status" {
+  name = "${var.name_prefix}-execution-status"
+  event_pattern = jsonencode({
+    source        = ["aws.states"]
+    "detail-type" = ["Step Functions Execution Status Change"]
+    detail = {
+      stateMachineArn = [aws_sfn_state_machine.pipeline.arn]
+      status          = ["TIMED_OUT", "FAILED", "ABORTED"]
+    }
+  })
+}
+
+resource "aws_cloudwatch_event_target" "execution_status" {
+  rule      = aws_cloudwatch_event_rule.execution_status.name
+  target_id = "execution-status-watch"
+  arn       = module.execution_status_watch.arn
+}
+
+resource "aws_lambda_permission" "execution_status" {
+  statement_id   = "AllowExecutionStatusWatchInvoke"
+  action         = "lambda:InvokeFunction"
+  function_name  = module.execution_status_watch.function_name
+  principal      = "events.amazonaws.com"
+  source_arn     = aws_cloudwatch_event_rule.execution_status.arn
 }
 
 data "aws_iam_policy_document" "webhook_dispatch" {

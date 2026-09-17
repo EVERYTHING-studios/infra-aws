@@ -1,12 +1,3 @@
-output "endpoint_name" {
-  description = "SageMaker async endpoint name."
-  value       = aws_sagemaker_endpoint.this.name
-}
-
-output "endpoint_arn" {
-  value = aws_sagemaker_endpoint.this.arn
-}
-
 output "dispatcher_lambda_arn" {
   description = "Dispatcher Lambda ARN — the state machine invokes this for the Inference state."
   value       = module.dispatcher.arn
@@ -17,6 +8,11 @@ output "dispatcher_lambda_function_name" {
 }
 
 output "callback_lambda_arn" {
-  description = "Callback Lambda ARN (subscribed to the SageMaker SNS topics)."
+  description = "Callback Lambda ARN (subscribed to every region's SageMaker SNS topics)."
   value       = module.callback.arn
+}
+
+output "active_region_param_name" {
+  description = "SSM parameter holding the currently active SageMaker region (mutated by the sentinel at runtime)."
+  value       = aws_ssm_parameter.active_region.name
 }

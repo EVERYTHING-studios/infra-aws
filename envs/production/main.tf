@@ -26,6 +26,37 @@ provider "aws" {
   }
 }
 
+# Alternate SageMaker candidate regions (ml.g7e.2xlarge is offered in
+# exactly these). Unused until a region is appended to
+# sagemaker_candidate_regions — the module maps them explicitly.
+provider "aws" {
+  alias  = "useast2"
+  region = "us-east-2"
+
+  default_tags {
+    tags = {
+      service     = "generate"
+      environment = local.env
+      managed-by  = "terraform"
+      repository  = "EVERYTHING-studios/infra-aws"
+    }
+  }
+}
+
+provider "aws" {
+  alias  = "uswest2"
+  region = "us-west-2"
+
+  default_tags {
+    tags = {
+      service     = "generate"
+      environment = local.env
+      managed-by  = "terraform"
+      repository  = "EVERYTHING-studios/infra-aws"
+    }
+  }
+}
+
 data "aws_caller_identity" "current" {}
 
 locals {
@@ -112,16 +143,24 @@ module "inference" {
   source = "../../modules/generate-inference"
   env    = local.env
 
-  name_prefix       = local.name_prefix
-  dist_dir          = local.dist_dir
-  tasks_table_name  = module.tasks.table_name
-  tasks_table_arn   = module.tasks.table_arn
-  work_bucket_name  = aws_s3_bucket.work.bucket
-  work_bucket_arn   = aws_s3_bucket.work.arn
-  inference_backend = var.inference_backend
-  postprocess_mode  = var.postprocess_mode
-  instance_type     = var.instance_type
-  low_vram          = var.low_vram
+  providers = {
+    aws         = aws
+    aws.useast2 = aws.useast2
+    aws.uswest2 = aws.uswest2
+  }
+
+  name_prefix                 = local.name_prefix
+  dist_dir                    = local.dist_dir
+  tasks_table_name            = module.tasks.table_name
+  tasks_table_arn             = module.tasks.table_arn
+  work_bucket_name            = aws_s3_bucket.work.bucket
+  work_bucket_arn             = aws_s3_bucket.work.arn
+  inference_backend           = var.inference_backend
+  postprocess_mode            = var.postprocess_mode
+  instance_type               = var.instance_type
+  low_vram                    = var.low_vram
+  sagemaker_max_capacity      = var.sagemaker_max_capacity
+  sagemaker_candidate_regions = var.sagemaker_candidate_regions
 }
 
 module "pipeline" {

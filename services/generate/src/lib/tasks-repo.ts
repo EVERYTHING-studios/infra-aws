@@ -78,6 +78,7 @@ export interface TaskUpdate {
   execution_arn?: string;
   inference_backend?: string;
   sagemaker_task_token?: string;
+  sagemaker_region?: string;
   finished_at?: string;
   remove?: string[];
 }

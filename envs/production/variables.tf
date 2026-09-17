@@ -37,3 +37,15 @@ variable "low_vram" {
   type        = string
   default     = "0"
 }
+
+variable "sagemaker_max_capacity" {
+  description = "SageMaker endpoint autoscaling max (min 0). Account-wide g7e quota L-5AA715AC is 4 in us-east-1 (per-region in the candidate regions); env maxima must sum within each region's quota."
+  type        = number
+  default     = 2
+}
+
+variable "sagemaker_candidate_regions" {
+  description = "Regions with a full SageMaker stack. SageMaker offers ml.g7e.2xlarge only in us-east-1/us-east-2/us-west-2; quota L-5AA715AC must be >= 1 before a region is appended. Order = sentinel failback priority."
+  type        = list(string)
+  default     = ["us-east-1"]
+}

@@ -1,4 +1,5 @@
 import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3';
+import { getTask, updateTask } from '../lib/tasks-repo.js';
 import { enqueueWebhook } from '../lib/webhook-queue.js';
 import { requireEnv } from '../lib/env.js';
 

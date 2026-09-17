@@ -125,8 +125,8 @@ With the custom `EndpointIdle` metric alarm (3 evaluation periods):
 **~3 min** (3-min alarm evaluation + ~30s scale-down activity). This is both
 safe and fast — the metric stays `0` (busy) while any `sagemaker_task_token`
 exists, so the alarm cannot fire mid-inference. See
-[Scale-to-zero](../modules/generate-inference/sagemaker/README.md#scale-to-zero)
-in the sagemaker module README.
+[Scale-to-zero](../modules/generate-inference/sagemaker-region/README.md#scale-to-zero)
+in the sagemaker-region module README.
 
 ## ml.g7e.2xlarge (Blackwell RTX PRO 6000)
 

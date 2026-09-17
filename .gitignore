@@ -3,7 +3,9 @@
 *.tfstate
 *.tfstate.*
 *.tfplan
+*.tfplan.*
 tfplan
+tfplan*.bin
 crash.log
 
 # Lambda build output
