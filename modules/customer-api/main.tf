@@ -252,13 +252,11 @@ resource "aws_apigatewayv2_authorizer" "customer" {
   authorizer_uri                    = module.customer_authorizer.invoke_arn
   authorizer_payload_format_version = "2.0"
   enable_simple_responses           = true
-  # Both credential headers are accepted; the response cache is keyed per
-  # identity tuple. Revocation latency is bounded by the TTL below.
-  identity_sources = [
-    "$request.header.Authorization",
-    "$request.header.x-api-key",
-  ]
-  authorizer_result_ttl_in_seconds = 300
+  # No identity_sources: HTTP APIs require ALL listed identity sources to be
+  # present or they 401 without invoking the authorizer — both single-header
+  # credential styles (Authorization: Bearer / x-api-key) must work. The
+  # authorizer runs per request; revocation is immediate.
+  authorizer_result_ttl_in_seconds = 0
 }
 
 resource "aws_lambda_permission" "customer_authorizer" {
