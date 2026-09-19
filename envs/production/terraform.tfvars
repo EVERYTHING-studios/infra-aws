@@ -19,3 +19,14 @@ low_vram      = "0"
 # Endpoint autoscaling max. Quota L-5AA715AC is per-region and now 4 in
 # us-east-1; staging 1 + production 1 fits comfortably.
 sagemaker_max_capacity = 1
+
+# SageMaker candidate regions. List order = sentinel failback priority.
+# us-east-2 first: the only region with demonstrated capacity (staging's
+# endpoint has been InService there since 2026-09-17; us-east-1 hit
+# InsufficientInstanceCapacity on every production create attempt,
+# 2026-09-16 through 2026-09-18). us-east-1 stays as failback candidate —
+# its regional stack (buckets/model/config) is already live.
+# us-east-2 prerequisites per the add-a-region runbook: quota L-5AA715AC = 2.0
+# (staging 1 + production 1 fits), artifacts replicated via
+# trellis2image/scripts/replicate_artifacts.sh.
+sagemaker_candidate_regions = ["us-east-2", "us-east-1"]
