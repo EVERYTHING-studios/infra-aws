@@ -385,7 +385,9 @@ resource "aws_apigatewayv2_route" "routes" {
 resource "aws_lambda_permission" "routes" {
   for_each = local.routes
 
-  statement_id  = "AllowApiGateway"
+  # One permission per route; Sid must be unique per function — 16 routes share
+  # 7 functions, so a shared Sid collides (AddPermission ResourceConflictException).
+  statement_id  = "AllowApiGateway-${replace(each.key, "/[^a-zA-Z0-9]+/", "")}"
   action        = "lambda:InvokeFunction"
   function_name = each.value.lambda.function_name
   principal     = "apigateway.amazonaws.com"
