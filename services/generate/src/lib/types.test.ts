@@ -31,6 +31,9 @@ describe('toApiTask', () => {
     // Internal fields must not leak to API callers.
     expect(toApiTask(record)).not.toHaveProperty('artifact_prefix');
     expect(toApiTask(record)).not.toHaveProperty('execution_arn');
+    expect(toApiTask(record)).not.toHaveProperty('source');
+    expect(toApiTask(record)).not.toHaveProperty('inference_started_at');
+    expect(toApiTask(record)).not.toHaveProperty('inference_finished_at');
   });
 
   it('passes through outputs when present', () => {

@@ -60,6 +60,14 @@ export interface CreateTaskRequest {
   idempotency_key?: string;
 }
 
+/** POST /v1/jobs body — customer API. No output hints: the destination is synthesized server-side. */
+export interface CreateJobRequest {
+  type: TaskType;
+  input: TaskInput;
+  options?: TaskOptions;
+  idempotency_key?: string;
+}
+
 export interface ModelUrls {
   glb?: string;
   fbx?: string;
@@ -95,6 +103,11 @@ export interface TaskRecord {
   sagemaker_region?: string;
   inference_backend?: string;
   idempotency_key?: string;
+  /** Origin of the task; absent = 'web-app' (legacy in-flight records). */
+  source?: 'web-app' | 'api';
+  /** When inference compute started/finished (SageMaker or stub) — usage-billing data. */
+  inference_started_at?: string;
+  inference_finished_at?: string;
   created_at: string;
   updated_at: string;
   finished_at?: string;
@@ -115,9 +128,11 @@ export interface ApiTask {
   finished_at: string | null;
 }
 
-/** Payload POSTed to the web-app webhook. */
+/** Payload delivered to webhook consumers (web-app and customer endpoints). */
 export interface WebhookEvent {
-  event: 'task.updated';
+  event: 'task.updated' | 'ping';
+  event_id: string;
+  user_id: string;
   task_id: string;
   type: TaskType;
   status: TaskStatus;
@@ -127,7 +142,6 @@ export interface WebhookEvent {
   error?: TaskError;
   timestamp: string;
 }
-
 export function toApiTask(record: TaskRecord): ApiTask {
   return {
     task_id: record.task_id,

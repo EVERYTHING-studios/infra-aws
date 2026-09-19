@@ -58,6 +58,7 @@ export async function handler(event: DispatchInput): Promise<{ dispatched: true 
     sagemaker_task_token: event.task_token,
     sagemaker_region: conf.region,
     progress: 25,
+    inference_started_at: new Date().toISOString(),
   });
 
   return { dispatched: true };

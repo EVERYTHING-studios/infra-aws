@@ -29,6 +29,9 @@ export async function handler(event: PipelineContext): Promise<PipelineContext> 
 
   const fixturePath = join(dirname(fileURLToPath(import.meta.url)), 'fixtures', 'stub.glb');
   const glb = await readFile(fixturePath);
+  // Usage-billing timing: the stub GLB write stands in for the model run.
+  await updateTask(task.task_id, { inference_started_at: new Date().toISOString() });
+
   await s3.send(
     new PutObjectCommand({
       Bucket: requireEnv('WORK_BUCKET'),
@@ -37,6 +40,8 @@ export async function handler(event: PipelineContext): Promise<PipelineContext> 
       ContentType: 'model/gltf-binary',
     }),
   );
+
+  await updateTask(task.task_id, { inference_finished_at: new Date().toISOString() });
 
   return event;
 }

@@ -166,16 +166,19 @@ module "inference" {
 module "pipeline" {
   source = "../../modules/generate-pipeline"
 
-  name_prefix                = local.name_prefix
-  account_id                 = data.aws_caller_identity.current.account_id
-  dist_dir                   = local.dist_dir
-  tasks_table_name           = module.tasks.table_name
-  tasks_table_arn            = module.tasks.table_arn
-  work_bucket_name           = aws_s3_bucket.work.bucket
-  work_bucket_arn            = aws_s3_bucket.work.arn
-  assets_bucket_name         = data.aws_s3_bucket.model_assets.bucket
-  assets_bucket_arn          = data.aws_s3_bucket.model_assets.arn
-  assets_base_url            = local.assets_base_url
+  name_prefix         = local.name_prefix
+  account_id          = data.aws_caller_identity.current.account_id
+  dist_dir            = local.dist_dir
+  tasks_table_name    = module.tasks.table_name
+  tasks_table_arn     = module.tasks.table_arn
+  accounts_table_name = module.customer_api.accounts_table_name
+  accounts_table_arn  = module.customer_api.accounts_table_arn
+  work_bucket_name    = aws_s3_bucket.work.bucket
+  work_bucket_arn     = aws_s3_bucket.work.arn
+  assets_bucket_name  = data.aws_s3_bucket.model_assets.bucket
+  assets_bucket_arn   = data.aws_s3_bucket.model_assets.arn
+  assets_base_url     = local.assets_base_url
+
   cloudfront_distribution_id = var.cloudfront_distribution_id
   webhook_url                = local.webhook_url
   webhook_secret_arn         = aws_secretsmanager_secret.webhook_secret.arn
@@ -197,14 +200,35 @@ module "api_gateway" {
 module "api" {
   source = "../../modules/generate-api"
 
-  name_prefix        = local.name_prefix
-  dist_dir           = local.dist_dir
+  name_prefix = local.name_prefix
+  dist_dir    = local.dist_dir
+
   api_id             = module.api_gateway.api_id
   api_execution_arn  = module.api_gateway.api_execution_arn
   api_key_secret_arn = aws_secretsmanager_secret.api_key.arn
   tasks_table_name   = module.tasks.table_name
   tasks_table_arn    = module.tasks.table_arn
   state_machine_arn  = module.pipeline.state_machine_arn
-  webhook_queue_url  = module.pipeline.webhook_queue_url
-  webhook_queue_arn  = module.pipeline.webhook_queue_arn
+
+  webhook_queue_url          = module.pipeline.webhook_queue_url
+  webhook_queue_arn          = module.pipeline.webhook_queue_arn
+  customer_webhook_queue_url = module.pipeline.customer_webhook_queue_url
+  customer_webhook_queue_arn = module.pipeline.customer_webhook_queue_arn
+}
+
+module "customer_api" {
+  source = "../../modules/customer-api"
+
+  name_prefix = local.name_prefix
+  dist_dir    = local.dist_dir
+
+  api_id             = module.api_gateway.api_id
+  api_execution_arn  = module.api_gateway.api_execution_arn
+  api_key_secret_arn = aws_secretsmanager_secret.api_key.arn
+  tasks_table_name   = module.tasks.table_name
+  tasks_table_arn    = module.tasks.table_arn
+  state_machine_arn  = module.pipeline.state_machine_arn
+
+  customer_webhook_queue_url = module.pipeline.customer_webhook_queue_url
+  customer_webhook_queue_arn = module.pipeline.customer_webhook_queue_arn
 }

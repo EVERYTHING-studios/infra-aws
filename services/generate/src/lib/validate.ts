@@ -1,4 +1,5 @@
 import {
+  CreateJobRequest,
   CreateTaskRequest,
   TASK_TYPES,
   TaskType,
@@ -27,26 +28,8 @@ function assertHttpUrl(value: string, field: string): void {
   }
 }
 
-/**
- * Validates and normalises a POST /v1/tasks body. Throws ValidationError with
- * a caller-safe message on any problem.
- */
-export function validateCreateTask(body: unknown): CreateTaskRequest {
-  if (typeof body !== 'object' || body === null) {
-    throw new ValidationError('request body must be a JSON object');
-  }
-  const req = body as Record<string, unknown>;
-
-  const type = req.type as TaskType;
-  if (!TASK_TYPES.includes(type)) {
-    throw new ValidationError(`type must be one of: ${TASK_TYPES.join(', ')}`);
-  }
-
-  const input = (req.input ?? {}) as Record<string, unknown>;
-  if (typeof input !== 'object' || Array.isArray(input)) {
-    throw new ValidationError('input must be an object');
-  }
-
+/** Per-type input validation shared by the web-app task and customer job endpoints. */
+function validateTaskInput(type: TaskType, input: Record<string, unknown>): void {
   switch (type) {
     case 'text-to-3d-preview': {
       if (typeof input.prompt !== 'string' || input.prompt.trim().length === 0) {
@@ -84,6 +67,29 @@ export function validateCreateTask(body: unknown): CreateTaskRequest {
       break;
     }
   }
+}
+
+/**
+ * Validates and normalises a POST /v1/tasks body. Throws ValidationError with
+ * a caller-safe message on any problem.
+ */
+export function validateCreateTask(body: unknown): CreateTaskRequest {
+  if (typeof body !== 'object' || body === null) {
+    throw new ValidationError('request body must be a JSON object');
+  }
+  const req = body as Record<string, unknown>;
+
+  const type = req.type as TaskType;
+  if (!TASK_TYPES.includes(type)) {
+    throw new ValidationError(`type must be one of: ${TASK_TYPES.join(', ')}`);
+  }
+
+  const input = (req.input ?? {}) as Record<string, unknown>;
+  if (typeof input !== 'object' || Array.isArray(input)) {
+    throw new ValidationError('input must be an object');
+  }
+
+  validateTaskInput(type, input);
 
   // Output hints are required for everything except refine (which inherits
   // them from its parent task).
@@ -110,6 +116,46 @@ export function validateCreateTask(body: unknown): CreateTaskRequest {
     input: input as CreateTaskRequest['input'],
     options: (req.options ?? {}) as CreateTaskRequest['options'],
     output: output as CreateTaskRequest['output'],
+    idempotency_key: idempotencyKey as string | undefined,
+  };
+}
+
+/**
+ * Validates and normalises a POST /v1/jobs body (customer API). Same input
+ * rules as validateCreateTask, but `output` is rejected outright: customer
+ * job destinations are synthesized server-side, never client-chosen.
+ */
+export function validateCreateJob(body: unknown): CreateJobRequest {
+  if (typeof body !== 'object' || body === null) {
+    throw new ValidationError('request body must be a JSON object');
+  }
+  const req = body as Record<string, unknown>;
+
+  if (req.output !== undefined) {
+    throw new ValidationError('output is not accepted on this endpoint');
+  }
+
+  const type = req.type as TaskType;
+  if (!TASK_TYPES.includes(type)) {
+    throw new ValidationError(`type must be one of: ${TASK_TYPES.join(', ')}`);
+  }
+
+  const input = (req.input ?? {}) as Record<string, unknown>;
+  if (typeof input !== 'object' || Array.isArray(input)) {
+    throw new ValidationError('input must be an object');
+  }
+
+  validateTaskInput(type, input);
+
+  const idempotencyKey = req.idempotency_key;
+  if (idempotencyKey !== undefined && (typeof idempotencyKey !== 'string' || idempotencyKey.length === 0 || idempotencyKey.length > 256)) {
+    throw new ValidationError('idempotency_key must be a non-empty string of at most 256 characters');
+  }
+
+  return {
+    type,
+    input: input as CreateJobRequest['input'],
+    options: (req.options ?? {}) as CreateJobRequest['options'],
     idempotency_key: idempotencyKey as string | undefined,
   };
 }

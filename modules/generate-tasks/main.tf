@@ -3,7 +3,10 @@
 # Item layout:
 #   pk      = TASK#{task_id}            (ULID task ids)
 #   gsi1pk  = IDEMPOTENCY#{key}         (sparse; create-task replay protection)
+#   gsi1pk  = USER#{user_id}#IDEMP#{key}   (per-user scope; API-created tasks)
 #   gsi2pk  = STATUS#{status}, gsi2sk = created_at   (ops sweeps / stuck-task queries)
+#   gsi3pk  = USER#{user_id}, gsi3sk = created_at           (sparse; API jobs list)
+#   gsi4pk  = USER#{user_id}#STATUS#{status}, gsi3sk = created_at  (sparse; filtered list)
 #   ttl     = epoch seconds, 90 days after creation
 
 terraform {
@@ -42,6 +45,21 @@ resource "aws_dynamodb_table" "tasks" {
     type = "S"
   }
 
+  attribute {
+    name = "gsi3pk"
+    type = "S"
+  }
+
+  attribute {
+    name = "gsi3sk"
+    type = "S"
+  }
+
+  attribute {
+    name = "gsi4pk"
+    type = "S"
+  }
+
   global_secondary_index {
     name            = "gsi1"
     hash_key        = "gsi1pk"
@@ -52,6 +70,22 @@ resource "aws_dynamodb_table" "tasks" {
     name            = "gsi2"
     hash_key        = "gsi2pk"
     range_key       = "gsi2sk"
+    projection_type = "ALL"
+  }
+
+  # Customer API per-user job listing. Sparse: only API-created tasks
+  # (source = 'api') write these keys, so web-app tasks cost nothing.
+  global_secondary_index {
+    name            = "gsi3"
+    hash_key        = "gsi3pk"
+    range_key       = "gsi3sk"
+    projection_type = "ALL"
+  }
+
+  global_secondary_index {
+    name            = "gsi4"
+    hash_key        = "gsi4pk"
+    range_key       = "gsi3sk"
     projection_type = "ALL"
   }
 

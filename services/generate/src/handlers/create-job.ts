@@ -1,7 +1,7 @@
 import { ulid } from 'ulid';
 import { SFNClient, StartExecutionCommand } from '@aws-sdk/client-sfn';
 import type { APIGatewayProxyEventV2, APIGatewayProxyResultV2 } from 'aws-lambda';
-import { validateCreateTask, ValidationError } from '../lib/validate.js';
+import { validateCreateJob, ValidationError } from '../lib/validate.js';
 import {
   findByIdempotencyKey,
   getTask,
@@ -10,15 +10,30 @@ import {
   updateTask,
 } from '../lib/tasks-repo.js';
 import { TaskRecord } from '../lib/types.js';
-import { json, errorResponse } from '../lib/http.js';
+import { json, errorResponse, authorizerUserId } from '../lib/http.js';
 import { requireEnv } from '../lib/env.js';
 
 const sfn = new SFNClient({});
 
+/**
+ * POST /v1/jobs — customer API render job creation. Mirrors create-task but:
+ *  - user identity comes from the customer authorizer context (per-user key),
+ *  - output hints are synthesized (job_id = fresh ULID), never client-chosen,
+ *  - idempotency is scoped per user,
+ *  - the task is marked source: 'api' so listings/webhooks route to the
+ *    customer surfaces. API jobs do not consume credits and create no
+ *    Supabase rows — usage billing is future work.
+ */
 export async function handler(event: APIGatewayProxyEventV2): Promise<APIGatewayProxyResultV2> {
+  const userId = authorizerUserId(event);
+  if (!userId) {
+    // The customer authorizer always sets user_id; absence is a wiring fault.
+    return errorResponse(502, 'internal_error', 'authorizer context missing user_id');
+  }
+
   let request;
   try {
-    request = validateCreateTask(JSON.parse(event.body ?? '{}'));
+    request = validateCreateJob(JSON.parse(event.body ?? '{}'));
   } catch (err) {
     if (err instanceof ValidationError) {
       return errorResponse(400, 'invalid_request', err.message);
@@ -30,22 +45,22 @@ export async function handler(event: APIGatewayProxyEventV2): Promise<APIGateway
   }
 
   if (request.idempotency_key) {
-    const existing = await findByIdempotencyKey(request.idempotency_key);
+    const existing = await findByIdempotencyKey(request.idempotency_key, userId);
     if (existing) {
-      return json(202, { task_id: existing.task_id });
+      return json(202, { job_id: existing.task_id });
     }
   }
 
-  // Refine tasks chain onto a succeeded preview task and inherit its
-  // artifacts and output destination.
+  // Refine jobs chain onto a succeeded preview job owned by the same user.
+  // 404 (never 403) on any mismatch — no cross-user existence leak.
   let parent: TaskRecord | null = null;
   if (request.type === 'text-to-3d-refine') {
     parent = await getTask(request.input.preview_task_id!);
-    if (!parent) {
-      return errorResponse(404, 'parent_not_found', 'preview_task_id does not reference a known task');
+    if (!parent || parent.source !== 'api' || parent.user_id !== userId) {
+      return errorResponse(404, 'parent_not_found', 'preview_task_id does not reference a known job');
     }
     if (parent.status !== 'SUCCEEDED') {
-      return errorResponse(409, 'parent_not_ready', `preview task is ${parent.status}, expected SUCCEEDED`);
+      return errorResponse(409, 'parent_not_ready', `preview job is ${parent.status}, expected SUCCEEDED`);
     }
   }
 
@@ -57,12 +72,12 @@ export async function handler(event: APIGatewayProxyEventV2): Promise<APIGateway
     progress: 0,
     input: request.input,
     options: request.options ?? {},
-    user_id: request.output?.user_id ?? parent!.user_id,
-    job_id: request.output?.job_id ?? parent!.job_id,
+    user_id: userId,
+    job_id: ulid(), // synthesized; finalize lands at {ASSETS_BASE_URL}/model-assets/{user_id}/{job_id}.glb
     parent_task_id: parent?.task_id,
     artifact_prefix: parent?.artifact_prefix,
     idempotency_key: request.idempotency_key,
-    source: 'web-app',
+    source: 'api',
     created_at: now.toISOString(),
     updated_at: now.toISOString(),
     ttl: ttlFromNow(now),
@@ -79,5 +94,5 @@ export async function handler(event: APIGatewayProxyEventV2): Promise<APIGateway
   );
   await updateTask(record.task_id, { execution_arn: execution.executionArn });
 
-  return json(202, { task_id: record.task_id });
+  return json(202, { job_id: record.task_id });
 }

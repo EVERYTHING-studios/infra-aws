@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { validateCreateTask, ValidationError } from './validate.js';
+import { validateCreateJob, validateCreateTask, ValidationError } from './validate.js';
 
 const OUTPUT = {
   user_id: '11111111-2222-4333-8444-555555555555',
@@ -110,6 +110,50 @@ describe('validateCreateTask', () => {
         type: 'text-to-3d-preview',
         input: { prompt: 'x' },
         output: OUTPUT,
+        idempotency_key: 'k'.repeat(257),
+      }),
+    ).toThrow(/idempotency_key/);
+  });
+});
+
+describe('validateCreateJob', () => {
+  it('accepts a valid job without output hints', () => {
+    const result = validateCreateJob({
+      type: 'text-to-3d-preview',
+      input: { prompt: 'a teapot' },
+      idempotency_key: 'k1',
+    });
+    expect(result.type).toBe('text-to-3d-preview');
+    expect(result.input.prompt).toBe('a teapot');
+    expect(result.idempotency_key).toBe('k1');
+    expect(result).not.toHaveProperty('output');
+  });
+
+  it('rejects an output field outright', () => {
+    expect(() =>
+      validateCreateJob({
+        type: 'text-to-3d-preview',
+        input: { prompt: 'a teapot' },
+        output: OUTPUT,
+      }),
+    ).toThrow(/output is not accepted/);
+  });
+
+  it('rejects unknown job types', () => {
+    expect(() => validateCreateJob({ type: '3d-magic', input: {} })).toThrow(ValidationError);
+  });
+
+  it('requires preview_task_id for refine jobs', () => {
+    expect(() => validateCreateJob({ type: 'text-to-3d-refine', input: {} })).toThrow(
+      /preview_task_id/,
+    );
+  });
+
+  it('bounds the idempotency key with the same rule as the task endpoint', () => {
+    expect(() =>
+      validateCreateJob({
+        type: 'text-to-3d-preview',
+        input: { prompt: 'x' },
         idempotency_key: 'k'.repeat(257),
       }),
     ).toThrow(/idempotency_key/);

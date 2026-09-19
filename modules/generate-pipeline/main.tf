@@ -56,9 +56,42 @@ resource "aws_cloudwatch_metric_alarm" "webhook_dlq" {
   }
 }
 
-# ------------------------------------------------------------------
-# Pipeline Lambdas
-# ------------------------------------------------------------------
+# Customer webhooks: same delivery shape as the web-app webhook queue, but
+# per-user endpoints + secrets from the customer API accounts table.
+
+resource "aws_sqs_queue" "customer_webhook_dlq" {
+  name                      = "${var.name_prefix}-customer-webhook-dlq"
+  message_retention_seconds = 14 * 24 * 60 * 60
+}
+
+resource "aws_sqs_queue" "customer_webhook" {
+  name                       = "${var.name_prefix}-customer-webhook"
+  visibility_timeout_seconds = 60
+  message_retention_seconds  = 24 * 60 * 60
+
+  redrive_policy = jsonencode({
+    deadLetterTargetArn = aws_sqs_queue.customer_webhook_dlq.arn
+    maxReceiveCount     = 5
+  })
+}
+
+resource "aws_cloudwatch_metric_alarm" "customer_webhook_dlq" {
+  alarm_name          = "${var.name_prefix}-customer-webhook-dlq-not-empty"
+  alarm_description   = "Customer webhook deliveries are failing and have hit the DLQ."
+  namespace           = "AWS/SQS"
+  metric_name         = "ApproximateNumberOfMessagesVisible"
+  statistic           = "Maximum"
+  period              = 300
+  evaluation_periods  = 1
+  threshold           = 0
+  comparison_operator = "GreaterThanThreshold"
+  treat_missing_data  = "notBreaching"
+
+  dimensions = {
+    QueueName = aws_sqs_queue.customer_webhook_dlq.name
+  }
+}
+
 
 data "aws_iam_policy_document" "prepare" {
   statement {
@@ -73,7 +106,7 @@ data "aws_iam_policy_document" "prepare" {
 
   statement {
     actions   = ["sqs:SendMessage"]
-    resources = [aws_sqs_queue.webhook.arn]
+    resources = [aws_sqs_queue.webhook.arn, aws_sqs_queue.customer_webhook.arn]
   }
 }
 
@@ -88,11 +121,12 @@ module "prepare" {
   attach_policy = true
 
   environment = {
-    TASKS_TABLE       = var.tasks_table_name
-    WORK_BUCKET       = var.work_bucket_name
-    INFERENCE_BACKEND = var.inference_backend
-    POSTPROCESS_MODE  = var.postprocess_mode
-    WEBHOOK_QUEUE_URL = aws_sqs_queue.webhook.url
+    TASKS_TABLE                = var.tasks_table_name
+    WORK_BUCKET                = var.work_bucket_name
+    INFERENCE_BACKEND          = var.inference_backend
+    POSTPROCESS_MODE           = var.postprocess_mode
+    WEBHOOK_QUEUE_URL          = aws_sqs_queue.webhook.url
+    CUSTOMER_WEBHOOK_QUEUE_URL = aws_sqs_queue.customer_webhook.url
   }
 }
 
@@ -138,7 +172,7 @@ data "aws_iam_policy_document" "finalize" {
 
   statement {
     actions   = ["sqs:SendMessage"]
-    resources = [aws_sqs_queue.webhook.arn]
+    resources = [aws_sqs_queue.webhook.arn, aws_sqs_queue.customer_webhook.arn]
   }
 
   dynamic "statement" {
@@ -163,6 +197,7 @@ module "finalize" {
   environment = {
     TASKS_TABLE                = var.tasks_table_name
     WEBHOOK_QUEUE_URL          = aws_sqs_queue.webhook.url
+    CUSTOMER_WEBHOOK_QUEUE_URL = aws_sqs_queue.customer_webhook.url
     ASSETS_BASE_URL            = var.assets_base_url
     CLOUDFRONT_DISTRIBUTION_ID = var.cloudfront_distribution_id
   }
@@ -176,7 +211,7 @@ data "aws_iam_policy_document" "fail_task" {
 
   statement {
     actions   = ["sqs:SendMessage"]
-    resources = [aws_sqs_queue.webhook.arn]
+    resources = [aws_sqs_queue.webhook.arn, aws_sqs_queue.customer_webhook.arn]
   }
 }
 
@@ -188,10 +223,10 @@ module "fail_task" {
   timeout       = 60
   policy_json   = data.aws_iam_policy_document.fail_task.json
   attach_policy = true
-
   environment = {
-    TASKS_TABLE       = var.tasks_table_name
-    WEBHOOK_QUEUE_URL = aws_sqs_queue.webhook.url
+    TASKS_TABLE                = var.tasks_table_name
+    WEBHOOK_QUEUE_URL          = aws_sqs_queue.webhook.url
+    CUSTOMER_WEBHOOK_QUEUE_URL = aws_sqs_queue.customer_webhook.url
   }
 }
 
@@ -203,7 +238,7 @@ data "aws_iam_policy_document" "execution_status_watch" {
 
   statement {
     actions   = ["sqs:SendMessage"]
-    resources = [aws_sqs_queue.webhook.arn]
+    resources = [aws_sqs_queue.webhook.arn, aws_sqs_queue.customer_webhook.arn]
   }
 }
 
@@ -216,8 +251,9 @@ module "execution_status_watch" {
   attach_policy = true
 
   environment = {
-    TASKS_TABLE       = var.tasks_table_name
-    WEBHOOK_QUEUE_URL = aws_sqs_queue.webhook.url
+    TASKS_TABLE                = var.tasks_table_name
+    WEBHOOK_QUEUE_URL          = aws_sqs_queue.webhook.url
+    CUSTOMER_WEBHOOK_QUEUE_URL = aws_sqs_queue.customer_webhook.url
   }
 }
 
@@ -281,6 +317,43 @@ module "webhook_dispatch" {
 resource "aws_lambda_event_source_mapping" "webhook" {
   event_source_arn        = aws_sqs_queue.webhook.arn
   function_name           = module.webhook_dispatch.function_name
+  batch_size              = 5
+  function_response_types = ["ReportBatchItemFailures"]
+}
+
+data "aws_iam_policy_document" "customer_webhook_dispatch" {
+  statement {
+    actions   = ["dynamodb:GetItem"]
+    resources = [var.accounts_table_arn]
+  }
+
+  statement {
+    actions = [
+      "sqs:ReceiveMessage",
+      "sqs:DeleteMessage",
+      "sqs:GetQueueAttributes",
+    ]
+    resources = [aws_sqs_queue.customer_webhook.arn]
+  }
+}
+
+module "customer_webhook_dispatch" {
+  source = "../lambda-function"
+
+  function_name = "${var.name_prefix}-customer-webhook-dispatch"
+  dist_dir      = "${var.dist_dir}/customer-webhook-dispatch"
+  timeout       = 30
+  policy_json   = data.aws_iam_policy_document.customer_webhook_dispatch.json
+  attach_policy = true
+
+  environment = {
+    ACCOUNTS_TABLE = var.accounts_table_name
+  }
+}
+
+resource "aws_lambda_event_source_mapping" "customer_webhook" {
+  event_source_arn        = aws_sqs_queue.customer_webhook.arn
+  function_name           = module.customer_webhook_dispatch.function_name
   batch_size              = 5
   function_response_types = ["ReportBatchItemFailures"]
 }
