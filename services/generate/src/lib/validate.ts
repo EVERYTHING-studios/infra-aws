@@ -4,6 +4,7 @@ import {
   TASK_TYPES,
   TaskType,
 } from './types.js';
+import { DATA_URI_RE, MAX_INLINE_IMAGE_BYTES } from './data-uris.js';
 
 export class ValidationError extends Error {
   constructor(message: string) {
@@ -28,8 +29,22 @@ function assertHttpUrl(value: string, field: string): void {
   }
 }
 
+function assertDataImageUri(value: string, field: string): void {
+  const match = DATA_URI_RE.exec(value);
+  if (!match) {
+    throw new ValidationError(
+      `${field} data URIs must be base64 with media type image/png, image/jpeg, or image/webp`,
+    );
+  }
+  if ((match[2]!.length * 3) / 4 > MAX_INLINE_IMAGE_BYTES) {
+    throw new ValidationError(
+      `${field} data URI exceeds the ${MAX_INLINE_IMAGE_BYTES} byte image limit`,
+    );
+  }
+}
+
 /** Per-type input validation shared by the web-app task and customer job endpoints. */
-function validateTaskInput(type: TaskType, input: Record<string, unknown>): void {
+function validateTaskInput(type: TaskType, input: Record<string, unknown>, allowDataUris: boolean = false): void {
   switch (type) {
     case 'text-to-3d-preview': {
       if (typeof input.prompt !== 'string' || input.prompt.trim().length === 0) {
@@ -62,7 +77,11 @@ function validateTaskInput(type: TaskType, input: Record<string, unknown>): void
         if (typeof url !== 'string') {
           throw new ValidationError('input.image_urls must be strings');
         }
-        assertHttpUrl(url, 'input.image_urls');
+        if (allowDataUris && url.startsWith('data:')) {
+          assertDataImageUri(url, 'input.image_urls');
+        } else {
+          assertHttpUrl(url, 'input.image_urls');
+        }
       }
       break;
     }
@@ -145,7 +164,7 @@ export function validateCreateJob(body: unknown): CreateJobRequest {
     throw new ValidationError('input must be an object');
   }
 
-  validateTaskInput(type, input);
+  validateTaskInput(type, input, true);
 
   const idempotencyKey = req.idempotency_key;
   if (idempotencyKey !== undefined && (typeof idempotencyKey !== 'string' || idempotencyKey.length === 0 || idempotencyKey.length > 256)) {

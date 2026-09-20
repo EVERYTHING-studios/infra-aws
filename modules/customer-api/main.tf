@@ -182,6 +182,11 @@ data "aws_iam_policy_document" "create_job" {
     actions   = ["states:StartExecution"]
     resources = [var.state_machine_arn]
   }
+
+  statement {
+    actions   = ["s3:PutObject"]
+    resources = ["${var.work_bucket_arn}/tasks/*"]
+  }
 }
 
 module "create_job" {
@@ -196,6 +201,7 @@ module "create_job" {
   environment = {
     TASKS_TABLE       = var.tasks_table_name
     STATE_MACHINE_ARN = var.state_machine_arn
+    WORK_BUCKET       = var.work_bucket_name
   }
 }
 

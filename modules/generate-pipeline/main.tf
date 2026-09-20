@@ -100,7 +100,7 @@ data "aws_iam_policy_document" "prepare" {
   }
 
   statement {
-    actions   = ["s3:PutObject"]
+    actions   = ["s3:GetObject", "s3:PutObject"]
     resources = ["${var.work_bucket_arn}/*"]
   }
 

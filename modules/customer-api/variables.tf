@@ -36,6 +36,14 @@ variable "state_machine_arn" {
   type        = string
 }
 
+variable "work_bucket_name" {
+  type = string
+}
+
+variable "work_bucket_arn" {
+  type = string
+}
+
 variable "customer_webhook_queue_url" {
   description = "Customer webhook queue (webhook-endpoint test pings)."
   type        = string

@@ -6,6 +6,9 @@ const OUTPUT = {
   job_id: '99999999-8888-4777-8666-555555555555',
 };
 
+// 1x1 transparent PNG.
+const PNG_B64 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==';
+
 describe('validateCreateTask', () => {
   it('accepts a valid text-to-3d-preview request', () => {
     const result = validateCreateTask({
@@ -157,5 +160,43 @@ describe('validateCreateJob', () => {
         idempotency_key: 'k'.repeat(257),
       }),
     ).toThrow(/idempotency_key/);
+  });
+
+  it('accepts a valid png data URI on jobs', () => {
+    const dataUri = `data:image/png;base64,${PNG_B64}`;
+    const result = validateCreateJob({
+      type: 'image-to-3d',
+      input: { image_urls: [dataUri] },
+    });
+    expect(result.input.image_urls).toEqual([dataUri]);
+  });
+
+  it('rejects data URIs with an unsupported media type', () => {
+    expect(() =>
+      validateCreateJob({
+        type: 'image-to-3d',
+        input: { image_urls: [`data:image/gif;base64,${PNG_B64}`] },
+      }),
+    ).toThrow(/data URIs must be base64/);
+  });
+
+  it('rejects data URIs over the inline byte cap', () => {
+    const oversized = 'A'.repeat(((4_194_304 + 1) * 4) / 3);
+    expect(() =>
+      validateCreateJob({
+        type: 'image-to-3d',
+        input: { image_urls: [`data:image/png;base64,${oversized}`] },
+      }),
+    ).toThrow(/4194304/);
+  });
+
+  it('still rejects data URIs on the task endpoint (jobs-only feature)', () => {
+    expect(() =>
+      validateCreateTask({
+        type: 'image-to-3d',
+        input: { image_urls: [`data:image/png;base64,${PNG_B64}`] },
+        output: OUTPUT,
+      }),
+    ).toThrow(/http\(s\) URL/);
   });
 });

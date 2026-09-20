@@ -12,6 +12,7 @@ import {
 import { TaskRecord } from '../lib/types.js';
 import { json, errorResponse, authorizerUserId } from '../lib/http.js';
 import { requireEnv } from '../lib/env.js';
+import { isDataUri, offloadDataUri } from '../lib/data-uris.js';
 
 const sfn = new SFNClient({});
 
@@ -64,9 +65,22 @@ export async function handler(event: APIGatewayProxyEventV2): Promise<APIGateway
     }
   }
 
+  // Offload inline data-URI images to S3 before persisting: the task record
+  // must hold a durable s3:// ref, never megabytes of base64 (DynamoDB item
+  // cap is 400 KB). Runs after the idempotency check so replays don't re-upload.
+  const taskId = ulid();
+  const imageUrls = request.input.image_urls;
+  if (imageUrls) {
+    request.input.image_urls = await Promise.all(
+      imageUrls.map((url, index) =>
+        isDataUri(url) ? offloadDataUri(url, `tasks/${taskId}/uploads/${index}`) : url,
+      ),
+    );
+  }
+
   const now = new Date();
   const record: TaskRecord = {
-    task_id: ulid(),
+    task_id: taskId,
     type: request.type,
     status: 'PENDING',
     progress: 0,

@@ -1,7 +1,8 @@
-import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3';
+import { S3Client, GetObjectCommand, PutObjectCommand } from '@aws-sdk/client-s3';
 import { getTask, updateTask } from '../lib/tasks-repo.js';
 import { enqueueWebhook } from '../lib/webhook-queue.js';
 import { requireEnv } from '../lib/env.js';
+import { MAX_FETCH_IMAGE_BYTES } from '../lib/data-uris.js';
 
 const s3 = new S3Client({});
 
@@ -33,9 +34,29 @@ export async function handler(event: PrepareInput): Promise<PipelineContext> {
   // Stage input images so inference reads only from our own bucket.
   const imageUrls = task.input.image_urls ?? [];
   for (const [index, url] of imageUrls.entries()) {
+    if (url.startsWith('s3://')) {
+      const parsed = new URL(url);
+      const obj = await s3.send(
+        new GetObjectCommand({ Bucket: parsed.hostname, Key: decodeURIComponent(parsed.pathname.slice(1)) }),
+      );
+      const body = Buffer.from(await obj.Body!.transformToByteArray());
+      await s3.send(
+        new PutObjectCommand({
+          Bucket: workBucket,
+          Key: `${artifactPrefix}/input/${index}`,
+          Body: body,
+          ContentType: obj.ContentType ?? 'application/octet-stream',
+        }),
+      );
+      continue;
+    }
     const response = await fetch(url);
     if (!response.ok) {
       throw new Error(`Failed to fetch input image ${index}: HTTP ${response.status}`);
+    }
+    const declaredBytes = Number(response.headers.get('content-length') ?? '0');
+    if (declaredBytes > MAX_FETCH_IMAGE_BYTES) {
+      throw new Error(`input image ${index} is ${declaredBytes} bytes, exceeding the ${MAX_FETCH_IMAGE_BYTES} byte limit`);
     }
     const body = Buffer.from(await response.arrayBuffer());
     await s3.send(
