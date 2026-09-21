@@ -16,7 +16,8 @@ All are single-GPU instances; multi-GPU instances (g5.12x+, p4d, p5) waste all
 but one GPU on this single-GPU-per-render workload. The deployment now runs
 **one endpoint per (region × instance type)** with a capacity sentinel electing
 by the **cold-price chain `g5 → g6e → g7e`** (measured cold-cycle costs:
-$0.39 / ~$0.70 est / $0.86–0.93 per cold request — see the per-instance
+$0.35 (re-measured 2026-09-21 on the multi-arch image) / ~$0.70 est /
+$0.86–0.93 per cold request — see the per-instance
 sections below). For this scale-to-zero endpoint cold cost dominates, so the
 cheapest cold cycle wins even though g7e's warm cost ($0.067/req) is 10×
 cheaper — g7e serves only when g5 AND g6e are both unavailable (Blackwell
@@ -135,6 +136,35 @@ safe and fast — the metric stays `0` (busy) while any `sagemaker_task_token`
 exists, so the alarm cannot fire mid-inference. See
 [Scale-to-zero](../modules/generate-inference/sagemaker-region/README.md#scale-to-zero)
 in the sagemaker-region module README.
+
+### Re-measure on the multi-arch image (2026-09-21, chain head)
+
+First cold cycle after the precision-v1.1 multi-arch cutover (per-(region ×
+type) endpoints, sentinel chain). Task `01M31BKJPW1Y061G0K7HDNDGX7`, submitted
+after scale-to-zero, served by the chain head `generate-staging-sagemaker-g5`
+(us-east-1) — confirmed via `InvocationsProcessed=1` on that endpoint:
+
+```
+Run type:           COLD (scale 0 -> 1)
+Billable window:    822s  (06:53:03 -> 07:06:46)
+  Cold start:       537s  (provision + image pull + weights load)
+  Inference GPU:    239.5s  (ModelLatency)
+  Cooldown:         285s  (last invocation -> scale-in end)
+Queue wait:         675s  (request queued while instance provisioned)
+Task wall-clock:    794s  (SUCCEEDED)
+Hourly rate:        $1.52/hr (AWS Pricing API)
+Est cost:           $0.35
+```
+
+vs the 2026-08-23 pre-multi-arch measurement (920s / $0.39): the cold cycle
+is ~11% cheaper and the GPU render is **39% faster** (239.5s vs 396s cold /
+388.6s warm on the Aug image) — the precision-v1 pipeline improvements carry
+to Ampere. At 239.5s the warm cost is **$0.101/request** (was $0.164). The
+run's GLB output measured **4.0 MB** (content-length) — the optimized output
+class on the multi-arch image. E2e chain behavior verified in the same run:
+dispatch via `active_endpoint`, SNS callback, task record
+`sagemaker_region=us-east-1` matching the elected entry.
+
 
 ## ml.g7e.2xlarge (Blackwell RTX PRO 6000)
 
@@ -268,7 +298,8 @@ invocation-framework overhead). GLB size (6.0 MB) is down 85% from the
 
 | Scenario | Instance | Warm time | $/hr | $/request |
 |---|---|---|---|---|
-| Current g5 (staging, low_vram=True) | g5.2xlarge | 389s | $1.52 | $0.164 |
+| Current g5 (staging, low_vram=True, Aug image) | g5.2xlarge | 389s | $1.52 | $0.164 |
+| g5 multi-arch precision-v1.1 (2026-09-21, chain head) | g5.2xlarge | 239.5s | $1.52 | $0.101 |
 | Current g6e (prod, low_vram=True) | g6e.2xlarge | 252s | $2.80 | $0.196 |
 | G7 (NOT recommended) | g7.2xlarge | ~252s | $3.15 | $0.220 |
 | **G7e + low_vram=False (CLOUD MEASURED)** | **g7e.2xlarge** | **57.8s** | **$4.20** | **$0.067** |
@@ -332,12 +363,11 @@ or the model pipeline.
 |---|---|---|---|
 | Hourly rate | $4.20 | $2.80 | $1.52 |
 | VRAM | 96 GB | 45 GB | 24 GB |
-| Memory bandwidth | 1,597 GB/s | 864 GB/s | 600 GB/s |
-| Cold start (provision + load) | 392s (~6.5 min) | ~5 min | ~10.7 min |
-| Cold-start $/request | **$0.86** (738s × $4.20/hr) | — | $0.39 (920s × $1.52/hr) |
+| Cold start (provision + load) | 392s (~6.5 min) | ~5 min | 537s (~9 min, 2026-09-21) |
+| Cold-start $/request | **$0.86** (738s × $4.20/hr) | — | **$0.35** (822s × $1.52/hr, 2026-09-21) |
 | Model load (local, NVMe) | ~82s | — | — |
-| Warm ModelLatency (GPU) | **57.8s** (cloud, measured) | 252.3s (4.2 min) | 388.6s (6.5 min) |
-| Warm run est cost | **$0.068** (57.8s × $4.20/hr) | ~$0.20 (252s × $2.80/hr) | ~$0.16 (389s × $1.52/hr) |
+| Warm ModelLatency (GPU) | **57.8s** (cloud, measured) | 252.3s (4.2 min) | 239.5s (2026-09-21, precision-v1.1; 388.6s on Aug image) |
+| Warm run est cost | **$0.068** (57.8s × $4.20/hr) | ~$0.20 (252s × $2.80/hr) | ~$0.10 (239.5s × $1.52/hr) |
 | Speedup vs g6e (warm) | **4.4×** (cloud-to-cloud) | 1× | 0.65× |
 | GLB size | **6.0 MB** (optimized) | 42.7 MB (pre-opt) | 42.8 MB (pre-opt) |
 | Scale-to-zero (safe) | ~3 min (new alarm) | ~17 min (old) / ~3 min (new) | ~3 min (new) |

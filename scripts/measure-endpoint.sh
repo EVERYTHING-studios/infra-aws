@@ -9,10 +9,14 @@
 # Inputs (env vars, all defaulted):
 #   TASK_ID   optional ULID; sets the window to that task's created_at..finished_at
 #   HOURS     window length when no TASK_ID (default 2)
-#   ENDPOINT  SageMaker endpoint name (default generate-staging-sagemaker)
+#   ENV       deployment env (default staging) — selects the tasks table and,
+#             when ENDPOINT is unset, the active_endpoint SSM parameter
+#   ENDPOINT  SageMaker endpoint name. Default: the currently elected chain
+#             endpoint (SSM /generate/<env>/sagemaker/active_endpoint) — set
+#             explicitly to measure a non-active chain entry (e.g. the g6e
+#             fallback or a -useast2 regional endpoint)
 #   VARIANT   production-variant name (default trellis)
 #   REGION    AWS region (default us-east-1)
-#   TABLE     DynamoDB task table name (default generate-staging-tasks)
 #   RATE      $/hour for the instance type; if unset, the AWS Pricing API is
 #             attempted and a warning printed if it cannot be parsed
 #   AWS_PROFILE  standard aws-cli profile env var (optional)
@@ -22,17 +26,27 @@
 #   bash scripts/measure-endpoint.sh            # last 2 hours
 set -euo pipefail
 
-ENDPOINT="${ENDPOINT:-generate-staging-sagemaker}"
+ENV="${ENV:-staging}"
+ENDPOINT="${ENDPOINT:-}"
 VARIANT="${VARIANT:-trellis}"
 REGION="${REGION:-us-east-1}"
 TASK_ID="${TASK_ID:-}"
 HOURS="${HOURS:-2}"
 AWS_PROFILE="${AWS_PROFILE:-}"
-TABLE="${TABLE:-generate-staging-tasks}"
+TABLE="${TABLE:-generate-${ENV}-tasks}"
 RATE="${RATE:-}"
 
 AWS="aws --region $REGION"
 [ -n "$AWS_PROFILE" ] && AWS="$AWS --profile $AWS_PROFILE"
+
+# Default endpoint: the currently elected chain endpoint (the sentinel
+# flips this SSM value on capacity evidence). Explicit ENDPOINT overrides —
+# needed to measure a non-active chain entry.
+if [ -z "$ENDPOINT" ]; then
+  ENDPOINT=$($AWS ssm get-parameter \
+    --name "/generate/${ENV}/sagemaker/active_endpoint" \
+    --query 'Parameter.Value' --output text)
+fi
 
 RID="endpoint/$ENDPOINT/variant/$VARIANT"
 
@@ -91,6 +105,7 @@ activities=$($AWS application-autoscaling describe-scaling-activities \
 # Without this, max_by(.StartTime) can pick a scale-in from a prior cycle that
 # ended before the current scale-up began, producing a negative billable window.
 win_start_iso=$(epoch_to_iso $win_start_epoch)
+scaling_source=""
 activities_in_window=$(echo "$activities" | jq --arg ws "$win_start_iso" \
   '[.[] | select(.StartTime >= $ws)]')
 
@@ -104,11 +119,74 @@ scale_in_end=$(echo "$activities_in_window" | jq -r --arg su "$scale_up_start" \
   '[.[] | select(.Cause | contains("scale-down")) | select(.StartTime >= $su)] | max_by(.StartTime) | .EndTime // empty')
 
 if [ -z "$scale_up_start" ]; then
-  echo ""
-  echo "=== WARM RUN (no scale-up activity in window) ==="
-  echo "The instance was already warm (initial_instance_count=1, never scaled"
-  echo "from zero). No cold-start/cooldown breakdown — reporting inference only."
-  is_warm=1
+  # SageMaker async endpoints frequently scale WITHOUT AAS activity
+  # records: native 0->1 provisioning on queued requests and alarm-driven
+  # step-policy executions don't appear in describe-scaling-activities.
+  # Fall back to async queue evidence: a HasBacklogWithoutCapacity
+  # datapoint > 0 in the window means a request waited for capacity — a
+  # true cold run even with no AAS activity.
+  hbc_start=$($AWS cloudwatch get-metric-statistics \
+    --namespace AWS/SageMaker \
+    --metric-name HasBacklogWithoutCapacity \
+    --dimensions Name=EndpointName,Value=$ENDPOINT \
+    --start-time "$(epoch_to_iso $win_start_epoch)" \
+    --end-time "$(epoch_to_iso $((win_end_epoch + 60)))" \
+    --period 60 --statistics Maximum \
+    --output json | jq -r \
+    '[.Datapoints[] | select(.Maximum > 0)] | sort_by(.Timestamp) | .[0].Timestamp // empty')
+
+  if [ -n "$hbc_start" ]; then
+    scaling_source="async-queue"
+    scale_up_start=$hbc_start
+    su_start_epoch=$(iso_to_epoch "$scale_up_start")
+    billable_start_epoch=$su_start_epoch
+    echo ""
+    echo "=== Scale-up (async native — no AAS activity records) ==="
+    echo "  Capacity requested: $scale_up_start (HasBacklogWithoutCapacity)"
+
+    # Scale-in evidence: the scale-to-zero alarm's action history records
+    # the step-policy execution even when AAS activities don't. The
+    # instance terminates a few minutes AFTER the action, so this end is a
+    # floor (labeled as such in the report).
+    alarm_name=$($AWS cloudwatch describe-alarms --output json \
+      | jq -r --arg ep "$ENDPOINT" \
+      '.MetricAlarms[] | select((.Dimensions[]?.Value) == $ep and .MetricName == "EndpointIdle") | .AlarmName' \
+      | head -1)
+    scale_down_action=""
+    if [ -n "$alarm_name" ]; then
+      scale_down_action=$($AWS cloudwatch describe-alarm-history \
+        --alarm-name "$alarm_name" \
+        --history-item-type Action \
+        --start-date "$win_start_iso" \
+        --output json | jq -r --arg su "$scale_up_start" \
+        '[.AlarmHistoryItems[] | select(.Timestamp >= $su)
+          | select(.HistorySummary | contains("Successfully executed action") and contains("scale-down"))
+          ] | max_by(.Timestamp) | .Timestamp // empty')
+    fi
+    if [ -n "$scale_down_action" ]; then
+      scale_in_start=$scale_down_action
+      scale_in_end=$scale_down_action
+      billable_end_epoch=$(iso_to_epoch "$scale_down_action")
+      echo ""
+      echo "=== Scale-in (alarm action; termination follows within minutes) ==="
+      echo "  Scale-down executed: $scale_down_action"
+    else
+      billable_end_epoch=$now_epoch
+      echo ""
+      echo "WARN: no scale-down alarm action in window; billable-so-far = scale-up -> now."
+      echo "      Re-run after scale-to-zero for the full billable window."
+    fi
+    billable_s=$((billable_end_epoch - billable_start_epoch))
+    echo ""
+    echo "Billable window (floor, excl. termination lag): $scale_up_start -> $(epoch_to_iso $billable_end_epoch) = ${billable_s}s"
+    is_warm=0
+  else
+    echo ""
+    echo "=== WARM RUN (no scale-up activity, no queued-without-capacity) ==="
+    echo "The instance was already warm. No cold-start/cooldown breakdown —"
+    echo "reporting inference only."
+    is_warm=1
+  fi
 else
   is_warm=0
   su_start_epoch=$(iso_to_epoch "$scale_up_start")
@@ -250,6 +328,9 @@ fi
 
 echo "Run type:           COLD (scale 0 -> 1)"
 echo "Billable window:    ${billable_s}s  ($scale_up_start -> $(epoch_to_iso $billable_end_epoch))"
+if [ "$scaling_source" = "async-queue" ]; then
+  echo "  Note:             floor — add instance termination lag (~2-10 min) for the full cycle"
+fi
 echo "  Cold start:       ${cold_start_s}s  (provision + download + weights load)"
 echo "  Inference GPU:    ${inference_gpu_s}s  (useful work)"
 echo "  Overhead:         ${overhead_s}s"
@@ -260,9 +341,20 @@ if [ -n "$TASK_ID" ]; then
   echo "Task wall-clock:    ${task_wall_s}s ($task_status)"
 fi
 
-# Estimated cost. INSTANCE_TYPE (default ml.g6e.2xlarge) + AWS_DEFAULT_REGION
-# select the pricing-API lookup; RATE overrides the lookup entirely.
-INSTANCE_TYPE="${INSTANCE_TYPE:-ml.g6e.2xlarge}"
+# Estimated cost. INSTANCE_TYPE + AWS_DEFAULT_REGION select the pricing-API
+# lookup; RATE overrides the lookup entirely. Default INSTANCE_TYPE is derived
+# from the endpoint name token (g5/g6e/g7e), matching whatever endpoint is
+# being measured.
+INSTANCE_TYPE="${INSTANCE_TYPE:-}"
+if [ -z "$INSTANCE_TYPE" ]; then
+  token=$(echo "$ENDPOINT" | sed -E 's/-(useast2|uswest2)$//' | awk -F- '{print $NF}')
+  case "$token" in
+    g5)  INSTANCE_TYPE="ml.g5.2xlarge" ;;
+    g6e) INSTANCE_TYPE="ml.g6e.2xlarge" ;;
+    g7e) INSTANCE_TYPE="ml.g7e.2xlarge" ;;
+    *)   echo "WARN: unrecognized endpoint token '$token'; set INSTANCE_TYPE or RATE for cost estimation." >&2 ;;
+  esac
+fi
 if [ -z "$RATE" ]; then
   RATE=$($AWS pricing get-products \
     --service-code AmazonSageMaker \
