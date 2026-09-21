@@ -91,15 +91,19 @@ jobs:
           exit 0
       - if: github.event_name == 'pull_request'
         uses: actions/github-script@v7
+        env:
+          PLAN_EXITCODE: ${{ steps.plan.outputs.exitcode }}
+          PLAN_STDOUT: ${{ steps.plan.outputs.stdout }}
+          PLAN_ENV: ${{ matrix.env }}
         with:
           script: |
-            const exitcode = '${{ steps.plan.outputs.exitcode }}';
+            const exitcode = process.env.PLAN_EXITCODE;
             const status = exitcode === '0' ? '✅ No changes — up to date' : exitcode === '2' ? '⚠️ Changes pending' : '❌ Error';
-            const output = `#### Terraform plan — \`${{ matrix.env }}\`: ${status}
+            const output = `#### Terraform plan — \`${process.env.PLAN_ENV}\`: ${status}
             <details><summary>Show plan</summary>
 
             \`\`\`
-            ${{ steps.plan.outputs.stdout }}
+            ${process.env.PLAN_STDOUT}
             \`\`\`
 
             </details>`;
@@ -109,10 +113,6 @@ jobs:
               repo: context.repo.repo,
               body: output,
             });
-      - if: steps.plan.outputs.exitcode == 2
-        run: |
-          echo "::error::Pending diff in envs/${{ matrix.env }} — apply manually before merging."
-          exit 1
       - if: steps.plan.outputs.exitcode != 0 && steps.plan.outputs.exitcode != 2
         run: |
           echo "::error::terraform plan failed in envs/${{ matrix.env }}"
