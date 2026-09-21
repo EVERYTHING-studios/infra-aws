@@ -14,7 +14,15 @@ postprocess_mode  = "lite"
 # per cold request; see trellis2image/docs/instance-sizing.md). The image is
 # multi-arch (sm_80/86/90/120) — no per-type build. low_vram is derived per
 # type inside the sagemaker-region module ("1" on g5's 24 GB, "0" elsewhere).
-sagemaker_instance_types = ["ml.g5.2xlarge", "ml.g6e.2xlarge", "ml.g7e.2xlarge"]
+# g7e dropped 2026-09-21 (same as staging): Blackwell still capacity-dry —
+# endpoint creates Failed with InsufficientInstanceCapacity after ~30 min of
+# retries in BOTH regions, and a Failed g7e endpoint aborts the whole apply
+# (the control plane converges only after every regional endpoint). Keeping
+# it in would predictably fail this env's apply mid-flight. Re-add
+# "ml.g7e.2xlarge" as a one-line change + full apply once Blackwell capacity
+# returns (quota L-5AA715AC is 4/2; the multi-arch image still carries
+# sm_120 kernels).
+sagemaker_instance_types = ["ml.g5.2xlarge", "ml.g6e.2xlarge"]
 
 # Endpoint autoscaling max. Per-type endpoint-usage quotas (checked 2026-09-19):
 # g5.2xlarge L-9614C779 = 2, g6e.2xlarge L-F8D7F460 = 1, g7e.2xlarge

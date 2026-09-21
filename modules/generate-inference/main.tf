@@ -150,6 +150,7 @@ locals {
           endpoint_arn      = try(local.sagemaker_regions[r].endpoints[local.type_tokens[t]].arn, null)
           input_bucket      = try(local.sagemaker_regions[r].input_bucket, null)
           input_bucket_arn  = try(local.sagemaker_regions[r].input_bucket_arn, null)
+          output_bucket_arn = try(local.sagemaker_regions[r].output_bucket_arn, null)
           success_topic_arn = try(local.sagemaker_regions[r].success_topic_arn, null)
           error_topic_arn   = try(local.sagemaker_regions[r].error_topic_arn, null)
         }

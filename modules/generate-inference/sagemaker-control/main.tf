@@ -43,9 +43,11 @@ locals {
   ])
 
   # Region-shared view of the endpoint list (buckets + topic ARNs are
-  # identical for every endpoint in a region, so last-wins is safe). Keyed
-  # for for_each over regions.
-  regions_by_name = { for e in var.endpoints : e.region => e }
+  # identical for every endpoint in a region). Grouped with the ellipsis
+  # (region => LIST of that region's entries) because the chain holds
+  # multiple types per region and HCL for-expressions reject duplicate keys;
+  # lookups take [0] — same-region entries share these fields.
+  regions_by_name = { for e in var.endpoints : e.region => e... }
 }
 
 # ------------------------------------------------------------------
@@ -333,24 +335,28 @@ resource "aws_lambda_permission" "eventbridge_sentinel" {
 # ------------------------------------------------------------------
 
 resource "aws_lambda_permission" "sns_success" {
-  # for_each over the STATIC region set derived from the endpoint list:
-  # var.endpoints values are known only after apply while a regional stack is
-  # being created, which Terraform rejects as a for_each key source.
-  for_each = toset(keys(local.regions_by_name))
+  # for_each over var.region_names — the STATIC region set. var.endpoints
+  # values are known only after apply while a regional stack is being
+  # created, which Terraform rejects as a for_each key source; the region
+  # set itself is static (same gates as the regional stacks). The per-region
+  # topic ARN is looked up from regions_by_name and MAY be apply-time
+  # unknown — fine for a resource argument, unlike for_each keys.
+  for_each = toset(var.region_names)
 
   statement_id  = "AllowSNSSuccessInvoke-${each.key}"
   action        = "lambda:InvokeFunction"
   principal     = "sns.amazonaws.com"
-  source_arn    = local.regions_by_name[each.key].success_topic_arn
+  source_arn    = local.regions_by_name[each.key][0].success_topic_arn
   function_name = module.callback.function_name
 }
 
 resource "aws_lambda_permission" "sns_error" {
-  for_each = toset(keys(local.regions_by_name))
+  for_each = toset(var.region_names)
 
   statement_id  = "AllowSNSErrorInvoke-${each.key}"
   action        = "lambda:InvokeFunction"
   principal     = "sns.amazonaws.com"
-  source_arn    = local.regions_by_name[each.key].error_topic_arn
+  source_arn    = local.regions_by_name[each.key][0].error_topic_arn
   function_name = module.callback.function_name
 }
+

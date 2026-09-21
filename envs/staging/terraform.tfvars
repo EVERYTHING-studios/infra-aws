@@ -18,7 +18,15 @@ postprocess_mode  = "lite"
 # per cold request; see trellis2image/docs/instance-sizing.md). The image is
 # multi-arch (sm_80/86/90/120) — no per-type build. low_vram is derived per
 # type inside the sagemaker-region module ("1" on g5's 24 GB, "0" elsewhere).
-sagemaker_instance_types = ["ml.g5.2xlarge", "ml.g6e.2xlarge", "ml.g7e.2xlarge"]
+# g7e dropped 2026-09-21: Blackwell still capacity-dry — endpoint creates
+# Failed with InsufficientInstanceCapacity after ~30 min of retries in BOTH
+# regions (the g7e chain tail was the entire apply's blocker: the control
+# plane converges only after every regional endpoint, and a Failed g7e
+# endpoint aborts it). The sentinel never elects a missing endpoint, so the
+# chain prefix serves fine without it. Re-add "ml.g7e.2xlarge" as a one-line
+# change + full apply once Blackwell capacity returns (quota L-5AA715AC is
+# 4/2 and the multi-arch image still carries sm_120 kernels).
+sagemaker_instance_types = ["ml.g5.2xlarge", "ml.g6e.2xlarge"]
 
 # Endpoint autoscaling max. Per-type endpoint-usage quotas (checked 2026-09-19):
 # g5.2xlarge L-9614C779 = 2, g6e.2xlarge L-F8D7F460 = 1, g7e.2xlarge
