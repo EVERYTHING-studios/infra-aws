@@ -83,36 +83,39 @@ jobs:
           exitcode=$?
           echo "exitcode=$exitcode" >> "$GITHUB_OUTPUT"
           echo "$output"
-          {
-            echo "stdout<<TFPLAN_EOF"
-            echo "$output"
-            echo "TFPLAN_EOF"
-          } >> "$GITHUB_OUTPUT"
+          printf '%s\n' "$output" > "tfplan-${{ matrix.env }}.txt"
+          if [ "$(wc -c < "tfplan-${{ matrix.env }}.txt")" -gt 60000 ]; then
+            {
+              echo "_Plan output truncated to the last 60 KB — see the full log in this job._"
+              tail -c 60000 "tfplan-${{ matrix.env }}.txt"
+            } > "tfplan-${{ matrix.env }}.tmp"
+            mv "tfplan-${{ matrix.env }}.tmp" "tfplan-${{ matrix.env }}.txt"
+          fi
           exit 0
-      - if: github.event_name == 'pull_request'
-        uses: actions/github-script@v7
+      - name: comment plan on PR
+        if: github.event_name == 'pull_request'
         env:
+          GH_TOKEN: ${{ github.token }}
           PLAN_EXITCODE: ${{ steps.plan.outputs.exitcode }}
-          PLAN_STDOUT: ${{ steps.plan.outputs.stdout }}
           PLAN_ENV: ${{ matrix.env }}
-        with:
-          script: |
-            const exitcode = process.env.PLAN_EXITCODE;
-            const status = exitcode === '0' ? '✅ No changes — up to date' : exitcode === '2' ? '⚠️ Changes pending' : '❌ Error';
-            const output = `#### Terraform plan — \`${process.env.PLAN_ENV}\`: ${status}
-            <details><summary>Show plan</summary>
-
-            \`\`\`
-            ${process.env.PLAN_STDOUT}
-            \`\`\`
-
-            </details>`;
-            await github.rest.issues.createComment({
-              issue_number: context.issue.number,
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              body: output,
-            });
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          case "$PLAN_EXITCODE" in
+            0) status='✅ No changes — up to date' ;;
+            2) status='⚠️ Changes pending' ;;
+            *) status='❌ Error' ;;
+          esac
+          {
+            echo "#### Terraform plan — \`$PLAN_ENV\`: $status"
+            echo '<details><summary>Show plan</summary>'
+            echo
+            echo '```'
+            cat "tfplan-$PLAN_ENV.txt"
+            echo '```'
+            echo
+            echo '</details>'
+          } > plan-comment.md
+          gh pr comment "$PR_NUMBER" --body-file plan-comment.md
       - if: steps.plan.outputs.exitcode != 0 && steps.plan.outputs.exitcode != 2
         run: |
           echo "::error::terraform plan failed in envs/${{ matrix.env }}"
