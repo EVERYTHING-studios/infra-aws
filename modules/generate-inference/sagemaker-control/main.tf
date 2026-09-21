@@ -306,6 +306,8 @@ module "capacity_sentinel" {
   timeout       = 60
   memory_size   = 256
   policy_json   = data.aws_iam_policy_document.sentinel.json
+  attach_policy = true
+
   environment = {
     TASKS_TABLE                = var.tasks_table_name
     WORK_BUCKET                = var.work_bucket_name
