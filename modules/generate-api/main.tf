@@ -115,7 +115,7 @@ data "aws_iam_policy_document" "cancel_task" {
 
   statement {
     actions   = ["sqs:SendMessage"]
-    resources = [var.webhook_queue_arn]
+    resources = [var.webhook_queue_arn, var.customer_webhook_queue_arn]
   }
 }
 
@@ -129,8 +129,9 @@ module "cancel_task" {
   attach_policy = true
 
   environment = {
-    TASKS_TABLE       = var.tasks_table_name
-    WEBHOOK_QUEUE_URL = var.webhook_queue_url
+    TASKS_TABLE                = var.tasks_table_name
+    WEBHOOK_QUEUE_URL          = var.webhook_queue_url
+    CUSTOMER_WEBHOOK_QUEUE_URL = var.customer_webhook_queue_url
   }
 }
 

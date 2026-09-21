@@ -62,6 +62,7 @@ export async function handler(event: APIGatewayProxyEventV2): Promise<APIGateway
     parent_task_id: parent?.task_id,
     artifact_prefix: parent?.artifact_prefix,
     idempotency_key: request.idempotency_key,
+    source: 'web-app',
     created_at: now.toISOString(),
     updated_at: now.toISOString(),
     ttl: ttlFromNow(now),

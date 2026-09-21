@@ -19,7 +19,7 @@ variable "api_execution_arn" {
 }
 
 variable "api_key_secret_arn" {
-  description = "Secrets Manager secret holding the API key."
+  description = "Secrets Manager secret holding the internal shared API key."
   type        = string
 }
 
@@ -32,21 +32,20 @@ variable "tasks_table_arn" {
 }
 
 variable "state_machine_arn" {
-  description = "Pipeline state machine started by create-task."
+  description = "Pipeline state machine started by create-job."
   type        = string
 }
 
-variable "webhook_queue_url" {
-  description = "Webhook queue (cancel-task notifies the web-app)."
-  type        = string
+variable "work_bucket_name" {
+  type = string
 }
 
-variable "webhook_queue_arn" {
+variable "work_bucket_arn" {
   type = string
 }
 
 variable "customer_webhook_queue_url" {
-  description = "Customer webhook queue (cancel-task notifies API-job owners)."
+  description = "Customer webhook queue (webhook-endpoint test pings)."
   type        = string
 }
 

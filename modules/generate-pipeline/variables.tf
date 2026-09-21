@@ -106,3 +106,13 @@ variable "subnet_ids" {
   description = "Subnets for the Fargate post-process task (need a route to S3/ECR)."
   type        = list(string)
 }
+
+variable "accounts_table_arn" {
+  description = "Customer API accounts table — the customer webhook dispatcher reads per-user endpoints/secrets."
+  type        = string
+}
+
+variable "accounts_table_name" {
+  description = "Customer API accounts table name — the customer webhook dispatcher reads per-user endpoints/secrets."
+  type        = string
+}

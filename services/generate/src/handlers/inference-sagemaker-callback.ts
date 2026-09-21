@@ -131,7 +131,7 @@ async function handleSuccess(
     }),
   );
 
-  await updateTask(taskId, { progress: 90 });
+  await updateTask(taskId, { progress: 90, inference_finished_at: new Date().toISOString() });
 
   // The next state (ChoosePostProcess) reads $.postprocess. postprocess is a
   // deployment-level constant (set by prepare from POSTPROCESS_MODE), so the
@@ -177,6 +177,8 @@ async function handleFailure(
     }
   }
   console.error(`Task ${taskId} inference failed: ${cause}`);
+  // Inference compute ended (unsuccessfully); usage-billing timing hook.
+  await updateTask(taskId, { inference_finished_at: new Date().toISOString() });
   await fail(taskToken, 'InferenceFailed', cause);
   await updateTask(taskId, { remove: ['sagemaker_task_token'] });
 }
