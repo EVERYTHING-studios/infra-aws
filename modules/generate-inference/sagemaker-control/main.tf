@@ -1,20 +1,21 @@
-# Control plane for the multi-region SageMaker inference backend. Instantiated
-# ONCE (us-east-1, default provider) by the parent module when
-# inference_backend = "sagemaker". Owns:
+# Control plane for the multi-region, multi-instance-type SageMaker inference
+# backend. Instantiated ONCE (us-east-1, default provider) by the parent
+# module when inference_backend = "sagemaker". Owns:
 #
 #   - the dispatcher / callback / scaler Lambdas (same function names as the
 #     pre-refactor sagemaker/ submodule),
-#   - the capacity-sentinel Lambda (region election + stranded-task rescue),
+#   - the capacity-sentinel Lambda (endpoint election + stranded-task rescue),
 #   - the EventBridge rate(1 minute) rule targeting scaler + sentinel,
 #   - per-topic SNS invoke permissions for the callback Lambda, one pair per
 #     candidate region,
-#   - the `active_region` / `last_flip` SSM parameters the sentinel mutates
+#   - the `active_endpoint` / `last_flip` SSM parameters the sentinel mutates
 #     at runtime (value changes are ignored here).
 #
-# The regional stacks (buckets, Model/Endpoint, topics, autoscaling) live in
-# the sibling `sagemaker-region/` module, one instance per candidate region.
-# This module receives their descriptors as the `regions` map — so all IAM
-# policies and Lambda env wiring here cover every candidate region.
+# The regional stacks (buckets, per-type Models/Endpoints, topics,
+# autoscaling) live in the sibling `sagemaker-region/` module, one instance
+# per candidate region. This module receives the (region x type) endpoint
+# list — `endpoints`, in the sentinel's type-major chain-priority order — so
+# all IAM policies and Lambda env wiring here cover every chain endpoint.
 
 terraform {
   required_version = ">= 1.10"
@@ -27,34 +28,55 @@ terraform {
   }
 }
 
+data "aws_region" "current" {}
+
+data "aws_caller_identity" "current" {}
+
 locals {
-  # Ordered region entries for the handlers' SAGEMAKER_REGIONS env. Array
-  # order = the sentinel's failback priority (region_priority). A JSON array,
-  # not an object — object keys serialize in lexicographic order, which would
-  # pin us-east-1 first regardless of configuration.
-  regions_json = jsonencode([
-    for region in var.region_priority : {
-      region       = region
-      endpointName = var.regions[region].endpoint_name
-      inputBucket  = var.regions[region].input_bucket
+  # Ordered endpoint entries for the handlers' SAGEMAKER_ENDPOINTS env.
+  # Array order = the sentinel's election priority (parent's type-major
+  # chain order). A JSON array, not an object — object keys serialize in
+  # lexicographic order, which would destroy the chain ordering.
+  endpoints_json = jsonencode([
+    for e in var.endpoints : {
+      region       = e.region
+      instanceType = e.token
+      endpointName = e.endpoint_name
+      inputBucket  = e.input_bucket
     }
   ])
 
-  region_values = values(var.regions)
+  # Region-shared view of the endpoint list (buckets + topic ARNs are
+  # identical for every endpoint in a region). Grouped with the ellipsis
+  # (region => LIST of that region's entries) because the chain holds
+  # multiple types per region and HCL for-expressions reject duplicate keys;
+  # lookups take [0] — same-region entries share these fields.
+  regions_by_name = { for e in var.endpoints : e.region => e... }
+
+  # Webhook queues are owned by generate-pipeline; constructing their
+  # URLs/ARNs here (queue names are fixed by that module) breaks the
+  # pipeline <-> inference module dependency cycle — same pattern as
+  # pipeline_state_machine_arn in the parent.
+  webhook_queue_url          = "https://sqs.${data.aws_region.current.region}.amazonaws.com/${data.aws_caller_identity.current.account_id}/${var.name_prefix}-webhook"
+  customer_webhook_queue_url = "https://sqs.${data.aws_region.current.region}.amazonaws.com/${data.aws_caller_identity.current.account_id}/${var.name_prefix}-customer-webhook"
+  webhook_queue_arn          = "arn:aws:sqs:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:${var.name_prefix}-webhook"
+  customer_webhook_queue_arn = "arn:aws:sqs:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:${var.name_prefix}-customer-webhook"
 }
 
 # ------------------------------------------------------------------
-# Election SSM parameters. The sentinel flips active_region on capacity
-# evidence and stamps last_flip; Terraform only owns their creation.
+# Election SSM parameters. The sentinel flips active_endpoint (the elected
+# endpoint's NAME — unique per region x type) on capacity evidence and
+# stamps last_flip; Terraform only owns their creation.
 # ------------------------------------------------------------------
 
-resource "aws_ssm_parameter" "active_region" {
-  name        = "/generate/${var.env}/sagemaker/active_region"
-  description = "SageMaker region currently receiving dispatches; flipped at runtime by the capacity-sentinel Lambda."
+resource "aws_ssm_parameter" "active_endpoint" {
+  name        = "/generate/${var.env}/sagemaker/active_endpoint"
+  description = "SageMaker endpoint name currently receiving dispatches; flipped at runtime by the capacity-sentinel Lambda."
   type        = "String"
-  # Initial value: us-east-1 (first candidate). The sentinel overwrites this
-  # at runtime — value changes are deliberately ignored below.
-  value = "us-east-1"
+  # Initial value: the chain head (first entry of var.endpoints). The
+  # sentinel overwrites this at runtime — value changes are deliberately
+  # ignored below.
+  value = var.endpoints[0].endpoint_name
 
   lifecycle {
     ignore_changes = [value]
@@ -63,7 +85,7 @@ resource "aws_ssm_parameter" "active_region" {
 
 resource "aws_ssm_parameter" "last_flip" {
   name        = "/generate/${var.env}/sagemaker/last_flip"
-  description = "ISO timestamp of the sentinel's last active_region flip; drives the flip cooldown."
+  description = "ISO timestamp of the sentinel's last active_endpoint flip; drives the flip cooldown."
   type        = "String"
   # Epoch so the first flip is never blocked by the cooldown.
   value = "1970-01-01T00:00:00.000Z"
@@ -75,10 +97,10 @@ resource "aws_ssm_parameter" "last_flip" {
 
 # ------------------------------------------------------------------
 # Dispatcher Lambda: invoked by the state machine's
-# lambda:invoke.waitForTaskToken Inference state. Reads active_region from
-# SSM, stages the input image into that region's input bucket, calls
-# InvokeEndpointAsync (InferenceId = task_id), and stores the Step Functions
-# task token + target region on the task record.
+# lambda:invoke.waitForTaskToken Inference state. Reads active_endpoint from
+# SSM, stages the input image into the elected endpoint's regional input
+# bucket, calls InvokeEndpointAsync (InferenceId = task_id), and stores the
+# Step Functions task token + target region on the task record.
 # ------------------------------------------------------------------
 
 data "aws_iam_policy_document" "dispatcher" {
@@ -89,22 +111,29 @@ data "aws_iam_policy_document" "dispatcher" {
 
   statement {
     actions   = ["s3:PutObject"]
-    resources = [for r in local.region_values : "${r.input_bucket_arn}/*"]
+    resources = toset([for e in var.endpoints : "${e.input_bucket_arn}/*"])
   }
 
   statement {
     actions   = ["sagemaker:InvokeEndpointAsync"]
-    resources = [for r in local.region_values : r.endpoint_arn]
+    resources = [for e in var.endpoints : e.endpoint_arn]
   }
 
   statement {
     actions   = ["ssm:GetParameter"]
-    resources = [aws_ssm_parameter.active_region.arn, aws_ssm_parameter.last_flip.arn]
+    resources = [aws_ssm_parameter.active_endpoint.arn, aws_ssm_parameter.last_flip.arn]
   }
 
   statement {
     actions   = ["dynamodb:GetItem", "dynamodb:UpdateItem"]
     resources = [var.tasks_table_arn]
+  }
+
+  # The dispatcher marks the task QUEUED and enqueues the task.updated
+  # webhook event (web-app + customer queues, owned by generate-pipeline).
+  statement {
+    actions   = ["sqs:SendMessage"]
+    resources = [local.webhook_queue_arn, local.customer_webhook_queue_arn]
   }
 }
 
@@ -119,10 +148,12 @@ module "dispatcher" {
   attach_policy = true
 
   environment = {
-    TASKS_TABLE         = var.tasks_table_name
-    WORK_BUCKET         = var.work_bucket_name
-    SAGEMAKER_REGIONS   = local.regions_json
-    ACTIVE_REGION_PARAM = aws_ssm_parameter.active_region.name
+    TASKS_TABLE                = var.tasks_table_name
+    WORK_BUCKET                = var.work_bucket_name
+    SAGEMAKER_ENDPOINTS        = local.endpoints_json
+    ACTIVE_ENDPOINT_PARAM      = aws_ssm_parameter.active_endpoint.name
+    WEBHOOK_QUEUE_URL          = local.webhook_queue_url
+    CUSTOMER_WEBHOOK_QUEUE_URL = local.customer_webhook_queue_url
   }
 }
 
@@ -138,7 +169,7 @@ module "dispatcher" {
 data "aws_iam_policy_document" "callback" {
   statement {
     actions   = ["s3:GetObject"]
-    resources = [for r in local.region_values : "${r.output_bucket_arn}/*"]
+    resources = toset([for e in var.endpoints : "${e.output_bucket_arn}/*"])
   }
 
   statement {
@@ -204,22 +235,22 @@ module "endpoint_scaler" {
   attach_policy = true
 
   environment = {
-    TASKS_TABLE       = var.tasks_table_name
-    SAGEMAKER_REGIONS = local.regions_json
+    TASKS_TABLE         = var.tasks_table_name
+    SAGEMAKER_ENDPOINTS = local.endpoints_json
   }
 }
 
 # ------------------------------------------------------------------
-# Capacity-sentinel Lambda: classifies every candidate region from
+# Capacity-sentinel Lambda: classifies every configured endpoint from
 # DescribeEndpoint + DescribeScalingActivities evidence, flips
-# active_region per the election rules (with cooldown), and re-dispatches
-# stranded tasks to the active region.
+# active_endpoint per the election rules (with cooldown), and re-dispatches
+# stranded tasks to the active endpoint.
 # ------------------------------------------------------------------
 
 data "aws_iam_policy_document" "sentinel" {
   statement {
     actions   = ["sagemaker:DescribeEndpoint"]
-    resources = [for r in local.region_values : r.endpoint_arn]
+    resources = [for e in var.endpoints : e.endpoint_arn]
   }
 
   statement {
@@ -230,7 +261,7 @@ data "aws_iam_policy_document" "sentinel" {
 
   statement {
     actions   = ["ssm:GetParameter", "ssm:PutParameter"]
-    resources = [aws_ssm_parameter.active_region.arn, aws_ssm_parameter.last_flip.arn]
+    resources = [aws_ssm_parameter.active_endpoint.arn, aws_ssm_parameter.last_flip.arn]
   }
 
   statement {
@@ -251,12 +282,19 @@ data "aws_iam_policy_document" "sentinel" {
 
   statement {
     actions   = ["s3:PutObject"]
-    resources = [for r in local.region_values : "${r.input_bucket_arn}/*"]
+    resources = toset([for e in var.endpoints : "${e.input_bucket_arn}/*"])
   }
 
   statement {
     actions   = ["sagemaker:InvokeEndpointAsync"]
-    resources = [for r in local.region_values : r.endpoint_arn]
+    resources = [for e in var.endpoints : e.endpoint_arn]
+  }
+
+  # QUEUED -> IN_PROGRESS promotion enqueues task.updated webhooks (queues
+  # owned by generate-pipeline).
+  statement {
+    actions   = ["sqs:SendMessage"]
+    resources = [local.webhook_queue_arn, local.customer_webhook_queue_arn]
   }
 }
 
@@ -271,12 +309,14 @@ module "capacity_sentinel" {
   attach_policy = true
 
   environment = {
-    TASKS_TABLE           = var.tasks_table_name
-    WORK_BUCKET           = var.work_bucket_name
-    SAGEMAKER_REGIONS     = local.regions_json
-    ACTIVE_REGION_PARAM   = aws_ssm_parameter.active_region.name
-    LAST_FLIP_PARAM       = aws_ssm_parameter.last_flip.name
-    FLIP_COOLDOWN_SECONDS = "300"
+    TASKS_TABLE                = var.tasks_table_name
+    WORK_BUCKET                = var.work_bucket_name
+    SAGEMAKER_ENDPOINTS        = local.endpoints_json
+    ACTIVE_ENDPOINT_PARAM      = aws_ssm_parameter.active_endpoint.name
+    LAST_FLIP_PARAM            = aws_ssm_parameter.last_flip.name
+    FLIP_COOLDOWN_SECONDS      = "300"
+    WEBHOOK_QUEUE_URL          = local.webhook_queue_url
+    CUSTOMER_WEBHOOK_QUEUE_URL = local.customer_webhook_queue_url
   }
 }
 
@@ -326,15 +366,18 @@ resource "aws_lambda_permission" "eventbridge_sentinel" {
 # ------------------------------------------------------------------
 
 resource "aws_lambda_permission" "sns_success" {
-  # for_each over the STATIC region list: var.regions values are known only
-  # after apply while a regional stack is being created, which Terraform
-  # rejects as a for_each key source.
+  # for_each over var.region_names — the STATIC region set. var.endpoints
+  # values are known only after apply while a regional stack is being
+  # created, which Terraform rejects as a for_each key source; the region
+  # set itself is static (same gates as the regional stacks). The per-region
+  # topic ARN is looked up from regions_by_name and MAY be apply-time
+  # unknown — fine for a resource argument, unlike for_each keys.
   for_each = toset(var.region_names)
 
   statement_id  = "AllowSNSSuccessInvoke-${each.key}"
   action        = "lambda:InvokeFunction"
   principal     = "sns.amazonaws.com"
-  source_arn    = var.regions[each.key].success_topic_arn
+  source_arn    = local.regions_by_name[each.key][0].success_topic_arn
   function_name = module.callback.function_name
 }
 
@@ -344,6 +387,7 @@ resource "aws_lambda_permission" "sns_error" {
   statement_id  = "AllowSNSErrorInvoke-${each.key}"
   action        = "lambda:InvokeFunction"
   principal     = "sns.amazonaws.com"
-  source_arn    = var.regions[each.key].error_topic_arn
+  source_arn    = local.regions_by_name[each.key][0].error_topic_arn
   function_name = module.callback.function_name
 }
+

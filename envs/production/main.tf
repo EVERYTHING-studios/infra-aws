@@ -157,8 +157,7 @@ module "inference" {
   work_bucket_arn             = aws_s3_bucket.work.arn
   inference_backend           = var.inference_backend
   postprocess_mode            = var.postprocess_mode
-  instance_type               = var.instance_type
-  low_vram                    = var.low_vram
+  sagemaker_instance_types    = var.sagemaker_instance_types
   sagemaker_max_capacity      = var.sagemaker_max_capacity
   sagemaker_candidate_regions = var.sagemaker_candidate_regions
 }

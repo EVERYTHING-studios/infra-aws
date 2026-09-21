@@ -26,26 +26,20 @@ variable "postprocess_mode" {
   default     = "lite"
 }
 
-variable "instance_type" {
-  description = "SageMaker async endpoint instance type. Default ml.g7e.2xlarge (Blackwell RTX PRO 6000, 96 GB VRAM, 1597 GB/s). g6e.2xlarge (L40S, 45 GB) is the fallback; g5.2xlarge (A10G, 24 GB) requires low_vram=\"1\"."
-  type        = string
-  default     = "ml.g7e.2xlarge"
-}
-
-variable "low_vram" {
-  description = "TRELLIS2_LOW_VRAM env: \"0\" (default) loads all models to GPU once (requires >=45 GB VRAM); \"1\" keeps models on CPU per-stage (safe on g5 24 GB)."
-  type        = string
-  default     = "0"
+variable "sagemaker_instance_types" {
+  description = "SageMaker async endpoint instance types — one endpoint per (region x type) in every candidate region; list order = the sentinel's cold-price chain order. low_vram is derived per type inside the module."
+  type        = list(string)
+  default     = ["ml.g5.2xlarge", "ml.g6e.2xlarge", "ml.g7e.2xlarge"]
 }
 
 variable "sagemaker_max_capacity" {
-  description = "SageMaker endpoint autoscaling max (min 0). Account-wide g7e quota L-5AA715AC is 4 in us-east-1 (per-region in the candidate regions); env maxima must sum within each region's quota."
+  description = "SageMaker endpoint autoscaling max (min 0). Instance-type quota is account-wide per region per type: staging + production maxima must sum within each region's endpoint-usage quota (g5.2xlarge L-9614C779 = 2, g6e.2xlarge L-F8D7F460 = 1, g7e.2xlarge L-5AA715AC = 4/2 in us-east-1/us-east-2, checked 2026-09-19)."
   type        = number
   default     = 2
 }
 
 variable "sagemaker_candidate_regions" {
-  description = "Regions with a full SageMaker stack. SageMaker offers ml.g7e.2xlarge only in us-east-1/us-east-2/us-west-2; quota L-5AA715AC must be >= 1 before a region is appended. Order = sentinel failback priority."
+  description = "Regions with a full SageMaker stack (us-east-1/us-east-2/us-west-2 — the only regions offering ml.g7e.2xlarge). Each (type, region) needs its endpoint-usage quota >= 1 before the type's endpoint can be created there. Order = sentinel region priority within each chain instance type."
   type        = list(string)
   default     = ["us-east-1"]
 }

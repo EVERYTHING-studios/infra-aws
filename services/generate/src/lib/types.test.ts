@@ -53,6 +53,7 @@ describe('toApiTask', () => {
 describe('isTerminal', () => {
   it('classifies statuses', () => {
     expect(isTerminal('PENDING')).toBe(false);
+    expect(isTerminal('QUEUED')).toBe(false);
     expect(isTerminal('IN_PROGRESS')).toBe(false);
     expect(isTerminal('SUCCEEDED')).toBe(true);
     expect(isTerminal('FAILED')).toBe(true);

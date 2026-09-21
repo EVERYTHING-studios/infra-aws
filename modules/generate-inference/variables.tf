@@ -46,20 +46,21 @@ variable "postprocess_mode" {
   default     = "lite"
 }
 
-variable "instance_type" {
-  description = "SageMaker async endpoint instance type. Default ml.g7e.2xlarge (Blackwell RTX PRO 6000, 96 GB VRAM, 1597 GB/s). g6e.2xlarge (L40S, 45 GB) is the fallback; g5.2xlarge (A10G, 24 GB) requires low_vram=\"1\"."
-  type        = string
-  default     = "ml.g7e.2xlarge"
-}
+variable "sagemaker_instance_types" {
+  description = "SageMaker async endpoint instance types — one endpoint per (region x type); list order = the sentinel's cold-price chain order (default: g5 -> g6e -> g7e, cheapest cold cycle first). low_vram is derived per type inside the sagemaker-region module."
+  type        = list(string)
+  default     = ["ml.g5.2xlarge", "ml.g6e.2xlarge", "ml.g7e.2xlarge"]
 
-variable "low_vram" {
-  description = "TRELLIS2_LOW_VRAM env forwarded to the SageMaker container: \"0\" (default) loads all models to GPU once (requires >=45 GB VRAM); \"1\" keeps models on CPU per-stage (safe on g5 24 GB)."
-  type        = string
-  default     = "0"
+  validation {
+    condition = length(var.sagemaker_instance_types) > 0 && alltrue([
+      for t in var.sagemaker_instance_types :
+      contains(["ml.g5.2xlarge", "ml.g6e.2xlarge", "ml.g7e.2xlarge"], t)
+    ])
+    error_message = "sagemaker_instance_types must be non-empty and contain only ml.g5.2xlarge, ml.g6e.2xlarge, or ml.g7e.2xlarge."
+  }
 }
-
 variable "sagemaker_max_capacity" {
-  description = "SageMaker endpoint autoscaling max (min 0). Account-wide instance-type quota is shared across envs: staging + production maxima must sum within the ml.g7e.2xlarge endpoint-usage quota (L-5AA715AC)."
+  description = "SageMaker endpoint autoscaling max (min 0). The instance-type quota is account-wide per region per type: every env's maxima must sum within each region's endpoint-usage quota (g5.2xlarge L-9614C779, g6e.2xlarge L-F8D7F460, g7e.2xlarge L-5AA715AC)."
   type        = number
   default     = 2
 }

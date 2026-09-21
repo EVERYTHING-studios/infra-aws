@@ -37,16 +37,50 @@ terraform {
 locals {
   variant_name = "trellis"
 
-  # Model container environment, tracked by the endpoint_config keepers so a
-  # change rolls a new Model + EndpointConfig (blue/green). Defined as a local
-  # to avoid a circular dependency: random_id keepers must not reference the
-  # model resource whose name derives from random_id.hex.
-  model_environment = {
+  # SageMaker resource names reject dots: token per chain instance type, used
+  # to suffix Model/EndpointConfig/Endpoint/policy/alarm names so each type's
+  # resources are distinct and stable.
+  type_token = {
+    "ml.g5.2xlarge"  = "g5"
+    "ml.g6e.2xlarge" = "g6e"
+    "ml.g7e.2xlarge" = "g7e"
+  }
+
+  # SageMaker names are region-scoped, so a token-only endpoint name would be
+  # identical in us-east-1 and us-east-2. The sentinel/dispatcher elect and
+  # look up endpoints by NAME across the whole chain, so endpoint names must
+  # be globally unique. Mirrors the bucket convention: us-east-1 keeps the
+  # legacy-style unsuffixed names, alternates gain a region suffix with the
+  # hyphens stripped. Only the Endpoint name uses this — Model/EndpointConfig
+  # names are random-hex (region-scoped) and alarms/policies/AAS targets are
+  # region-scoped resources.
+  region_token = var.region == "us-east-1" ? "" : "-${replace(var.region, "-", "")}"
+
+  # TRELLIS2_LOW_VRAM is derived per instance type (replaces the old low_vram
+  # var): g5's 24 GB VRAM cannot hold all ~17 GB of models resident, so it
+  # keeps models on CPU and swaps per-stage; g6e (45 GB) and g7e (96 GB) load
+  # everything to GPU once at startup.
+  low_vram_by_type = {
+    "ml.g5.2xlarge"  = "1"
+    "ml.g6e.2xlarge" = "0"
+    "ml.g7e.2xlarge" = "0"
+  }
+
+  # Model container environment per instance type: the fixed base merged with
+  # the per-type TRELLIS2_LOW_VRAM. Tracked by the endpoint_config keepers so
+  # a change rolls a new Model + EndpointConfig (blue/green). Defined as a
+  # local to avoid a circular dependency: random_id keepers must not reference
+  # the model resource whose name derives from random_id.hex.
+  model_environment_base = {
     HF_HOME                = "/opt/ml/model"
     HF_HUB_OFFLINE         = "1"
-    TRELLIS2_LOW_VRAM      = var.low_vram
     TRELLIS2_EAGER_LOAD    = "1"
     TRELLIS2_PIPELINE_TYPE = "1024"
+  }
+  model_environment = {
+    for t in var.instance_types : t => merge(local.model_environment_base, {
+      TRELLIS2_LOW_VRAM = local.low_vram_by_type[t]
+    })
   }
 }
 
@@ -179,15 +213,17 @@ data "aws_ssm_parameter" "weights_s3_uri" {
 }
 
 # ------------------------------------------------------------------
-# Model + EndpointConfig + Endpoint.
-#
-# A random suffix on the EndpointConfig name lets image/weights changes roll
-# forward via a new config (blue/green endpoint update) instead of a recreate
-# that would conflict with the live Endpoint. `keepers` tie the suffix to the
-# image and weights values from SSM.
+# Model + EndpointConfig + Endpoint — one per instance type in
+# var.instance_types (for_each). A random suffix on each EndpointConfig name
+# lets image/weights changes roll forward via a new config (blue/green
+# endpoint update) instead of a recreate that would conflict with the live
+# Endpoint. `keepers` tie the suffix to the image and weights values from SSM
+# (one random_id per type so one type's change doesn't rotate the others).
 # ------------------------------------------------------------------
 
 resource "random_id" "endpoint_config" {
+  for_each = toset(var.instance_types)
+
   byte_length = 4
 
   keepers = {
@@ -196,13 +232,15 @@ resource "random_id" "endpoint_config" {
     # Rotate the endpoint config (blue/green update) when the model environment
     # changes — SageMaker Models are immutable, so a new Model alone does NOT
     # update the running Endpoint; a new EndpointConfig + Endpoint update does.
-    environment   = jsonencode(local.model_environment)
-    instance_type = var.instance_type
+    environment   = jsonencode(local.model_environment[each.key])
+    instance_type = each.key
   }
 }
 
 resource "aws_sagemaker_model" "this" {
-  name               = "${var.name_prefix}-sagemaker-model-${random_id.endpoint_config.hex}"
+  for_each = toset(var.instance_types)
+
+  name               = "${var.name_prefix}-sagemaker-model-${local.type_token[each.key]}-${random_id.endpoint_config[each.key].hex}"
   execution_role_arn = var.execution_role_arn
 
   primary_container {
@@ -220,7 +258,7 @@ resource "aws_sagemaker_model" "this" {
       }
     }
 
-    environment = local.model_environment
+    environment = local.model_environment[each.key]
   }
 
   # Dependency anchor, not metadata: referencing the execution-role policy
@@ -245,12 +283,14 @@ resource "aws_sagemaker_model" "this" {
 }
 
 resource "aws_sagemaker_endpoint_configuration" "this" {
-  name = "${var.name_prefix}-sagemaker-${random_id.endpoint_config.hex}"
+  for_each = toset(var.instance_types)
+
+  name = "${var.name_prefix}-sagemaker-${local.type_token[each.key]}-${random_id.endpoint_config[each.key].hex}"
 
   production_variants {
     variant_name           = local.variant_name
-    model_name             = aws_sagemaker_model.this.name
-    instance_type          = var.instance_type
+    model_name             = aws_sagemaker_model.this[each.key].name
+    instance_type          = each.key
     initial_instance_count = 1
     initial_variant_weight = 1
     # The packaged weights (~16 GB) take time to download at provisioning.
@@ -292,9 +332,12 @@ resource "aws_sagemaker_endpoint_configuration" "this" {
 }
 
 resource "aws_sagemaker_endpoint" "this" {
-  name                 = "${var.name_prefix}-sagemaker"
-  endpoint_config_name = aws_sagemaker_endpoint_configuration.this.name
+  for_each = toset(var.instance_types)
+
+  name                 = "${var.name_prefix}-sagemaker-${local.type_token[each.key]}${local.region_token}"
+  endpoint_config_name = aws_sagemaker_endpoint_configuration.this[each.key].name
 }
+
 
 # ------------------------------------------------------------------
 # SNS topics for async notifications. The single us-east-1 callback Lambda
@@ -324,15 +367,17 @@ resource "aws_sns_topic_subscription" "error" {
 }
 
 # ------------------------------------------------------------------
-# Autoscaling: scale-to-zero (min 0, max = var.max_capacity).
-# HasBacklogWithoutCapacity scales up from zero (target tracking can't, with
-# zero instances there are no invocations-per-instance to track). Step
-# scaling on the same metric scales back down when idle.
+# Autoscaling: scale-to-zero (min 0, max = var.max_capacity) — one set per
+# instance type. HasBacklogWithoutCapacity scales up from zero (target
+# tracking can't, with zero instances there are no invocations-per-instance
+# to track). Step scaling on the same metric scales back down when idle.
 # ------------------------------------------------------------------
 
 resource "aws_appautoscaling_target" "this" {
+  for_each = toset(var.instance_types)
+
   service_namespace  = "sagemaker"
-  resource_id        = "endpoint/${aws_sagemaker_endpoint.this.name}/variant/${local.variant_name}"
+  resource_id        = "endpoint/${aws_sagemaker_endpoint.this[each.key].name}/variant/${local.variant_name}"
   scalable_dimension = "sagemaker:variant:DesiredInstanceCount"
 
   min_capacity = 0
@@ -341,10 +386,12 @@ resource "aws_appautoscaling_target" "this" {
 
 # Scale-up from zero on backlog.
 resource "aws_appautoscaling_policy" "scale_up" {
-  name               = "${var.name_prefix}-sagemaker-scale-up"
-  resource_id        = aws_appautoscaling_target.this.resource_id
-  service_namespace  = aws_appautoscaling_target.this.service_namespace
-  scalable_dimension = aws_appautoscaling_target.this.scalable_dimension
+  for_each = toset(var.instance_types)
+
+  name               = "${var.name_prefix}-sagemaker-scale-up-${local.type_token[each.key]}"
+  resource_id        = aws_appautoscaling_target.this[each.key].resource_id
+  service_namespace  = aws_appautoscaling_target.this[each.key].service_namespace
+  scalable_dimension = aws_appautoscaling_target.this[each.key].scalable_dimension
 
   step_scaling_policy_configuration {
     adjustment_type = "ChangeInCapacity"
@@ -358,7 +405,9 @@ resource "aws_appautoscaling_policy" "scale_up" {
 }
 
 resource "aws_cloudwatch_metric_alarm" "backlog" {
-  alarm_name          = "${var.name_prefix}-sagemaker-backlog"
+  for_each = toset(var.instance_types)
+
+  alarm_name          = "${var.name_prefix}-sagemaker-backlog-${local.type_token[each.key]}"
   alarm_description   = "Scale up the SageMaker async endpoint when requests are queued with no capacity."
   namespace           = "AWS/SageMaker"
   metric_name         = "HasBacklogWithoutCapacity"
@@ -371,10 +420,10 @@ resource "aws_cloudwatch_metric_alarm" "backlog" {
 
   # HasBacklogWithoutCapacity reports with EndpointName only (no VariantName).
   dimensions = {
-    EndpointName = aws_sagemaker_endpoint.this.name
+    EndpointName = aws_sagemaker_endpoint.this[each.key].name
   }
 
-  alarm_actions = [aws_appautoscaling_policy.scale_up.arn]
+  alarm_actions = [aws_appautoscaling_policy.scale_up[each.key].arn]
 }
 
 # Scale-in to zero when the scaler Lambda (sagemaker-control) reports the
@@ -382,10 +431,12 @@ resource "aws_cloudwatch_metric_alarm" "backlog" {
 # does NOT work for async endpoints because the metric is absent (not zero)
 # when idle.
 resource "aws_appautoscaling_policy" "scale_down" {
-  name               = "${var.name_prefix}-sagemaker-scale-down"
-  resource_id        = aws_appautoscaling_target.this.resource_id
-  service_namespace  = aws_appautoscaling_target.this.service_namespace
-  scalable_dimension = aws_appautoscaling_target.this.scalable_dimension
+  for_each = toset(var.instance_types)
+
+  name               = "${var.name_prefix}-sagemaker-scale-down-${local.type_token[each.key]}"
+  resource_id        = aws_appautoscaling_target.this[each.key].resource_id
+  service_namespace  = aws_appautoscaling_target.this[each.key].service_namespace
+  scalable_dimension = aws_appautoscaling_target.this[each.key].scalable_dimension
 
   step_scaling_policy_configuration {
     adjustment_type = "ChangeInCapacity"
@@ -399,7 +450,9 @@ resource "aws_appautoscaling_policy" "scale_down" {
 }
 
 resource "aws_cloudwatch_metric_alarm" "scale_to_zero" {
-  alarm_name          = "${var.name_prefix}-sagemaker-scale-to-zero"
+  for_each = toset(var.instance_types)
+
+  alarm_name          = "${var.name_prefix}-sagemaker-scale-to-zero-${local.type_token[each.key]}"
   alarm_description   = "Scale the SageMaker async endpoint to zero when idle (no active invocations for 3 minutes)."
   namespace           = "EverythingStudios/SageMaker"
   metric_name         = "EndpointIdle"
@@ -413,8 +466,8 @@ resource "aws_cloudwatch_metric_alarm" "scale_to_zero" {
   treat_missing_data = "breaching"
 
   dimensions = {
-    EndpointName = aws_sagemaker_endpoint.this.name
+    EndpointName = aws_sagemaker_endpoint.this[each.key].name
   }
 
-  alarm_actions = [aws_appautoscaling_policy.scale_down.arn]
+  alarm_actions = [aws_appautoscaling_policy.scale_down[each.key].arn]
 }

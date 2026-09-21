@@ -2,9 +2,15 @@
   "rules": [
     {
       "rulePriority": 1,
-      "description": "Prune untagged images older than 14 days; keep all tagged images.",
-      "selection": { "tagStatus": "untagged", "countType": "sinceImagePushed", "countUnit": "days", "countNumber": 14 },
-      "action": { "type": "expire" }
+      "description": "Prune untagged images older than 14 days.",
+      "selection": {"tagStatus": "untagged", "countType": "sinceImagePushed", "countUnit": "days", "countNumber": 14},
+      "action": {"type": "expire"}
+    },
+    {
+      "rulePriority": 2,
+      "description": "Expire tagged images beyond the 8 most recent; deployed images are always recent. 8 undeployed pushes = abandoned pipeline; eviction then is a feature.",
+      "selection": {"tagStatus": "tagged", "tagPatternList": ["*"], "countType": "imageCountMoreThan", "countNumber": 8},
+      "action": {"type": "expire"}
     }
   ]
 }
