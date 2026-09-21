@@ -16,6 +16,7 @@ export type TaskType = (typeof TASK_TYPES)[number];
 
 export const TASK_STATUSES = [
   'PENDING',
+  'QUEUED',
   'IN_PROGRESS',
   'SUCCEEDED',
   'FAILED',

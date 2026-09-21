@@ -29,7 +29,7 @@ export async function handler(event: ExecutionStatusEvent): Promise<{ task_id: s
   // No throw: the event may race record deletion.
   const task = await getTask(d.name);
   if (!task) return;
-  if (task.status !== 'IN_PROGRESS') return;
+  if (task.status !== 'IN_PROGRESS' && task.status !== 'QUEUED') return;
 
   const updated = await updateTask(task.task_id, {
     status: 'FAILED',

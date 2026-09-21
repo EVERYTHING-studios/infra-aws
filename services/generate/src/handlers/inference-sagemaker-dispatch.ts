@@ -2,6 +2,7 @@ import { SSMClient, GetParameterCommand } from '@aws-sdk/client-ssm';
 import { getTask, updateTask } from '../lib/tasks-repo.js';
 import { requireEnv } from '../lib/env.js';
 import { parseEndpointConfig, dispatchToRegion, type EndpointConfig } from '../lib/sagemaker.js';
+import { enqueueWebhook } from '../lib/webhook-queue.js';
 
 const ssm = new SSMClient({});
 /**
@@ -55,12 +56,15 @@ export async function handler(event: DispatchInput): Promise<{ dispatched: true 
 
   // Persist the task token so the callback can resume the state machine, and
   // the target region so the scaler and sentinel can attribute the task.
-  await updateTask(task.task_id, {
+  const updated = await updateTask(task.task_id, {
+    status: 'QUEUED',
     sagemaker_task_token: event.task_token,
     sagemaker_region: conf.region,
     progress: 25,
     inference_started_at: new Date().toISOString(),
   });
+
+  await enqueueWebhook(updated);
 
   return { dispatched: true };
 }

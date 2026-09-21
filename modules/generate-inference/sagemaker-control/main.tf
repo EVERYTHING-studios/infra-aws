@@ -28,6 +28,10 @@ terraform {
   }
 }
 
+data "aws_region" "current" {}
+
+data "aws_caller_identity" "current" {}
+
 locals {
   # Ordered endpoint entries for the handlers' SAGEMAKER_ENDPOINTS env.
   # Array order = the sentinel's election priority (parent's type-major
@@ -48,6 +52,15 @@ locals {
   # multiple types per region and HCL for-expressions reject duplicate keys;
   # lookups take [0] — same-region entries share these fields.
   regions_by_name = { for e in var.endpoints : e.region => e... }
+
+  # Webhook queues are owned by generate-pipeline; constructing their
+  # URLs/ARNs here (queue names are fixed by that module) breaks the
+  # pipeline <-> inference module dependency cycle — same pattern as
+  # pipeline_state_machine_arn in the parent.
+  webhook_queue_url          = "https://sqs.${data.aws_region.current.region}.amazonaws.com/${data.aws_caller_identity.current.account_id}/${var.name_prefix}-webhook"
+  customer_webhook_queue_url = "https://sqs.${data.aws_region.current.region}.amazonaws.com/${data.aws_caller_identity.current.account_id}/${var.name_prefix}-customer-webhook"
+  webhook_queue_arn          = "arn:aws:sqs:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:${var.name_prefix}-webhook"
+  customer_webhook_queue_arn = "arn:aws:sqs:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:${var.name_prefix}-customer-webhook"
 }
 
 # ------------------------------------------------------------------
@@ -115,6 +128,13 @@ data "aws_iam_policy_document" "dispatcher" {
     actions   = ["dynamodb:GetItem", "dynamodb:UpdateItem"]
     resources = [var.tasks_table_arn]
   }
+
+  # The dispatcher marks the task QUEUED and enqueues the task.updated
+  # webhook event (web-app + customer queues, owned by generate-pipeline).
+  statement {
+    actions   = ["sqs:SendMessage"]
+    resources = [local.webhook_queue_arn, local.customer_webhook_queue_arn]
+  }
 }
 
 module "dispatcher" {
@@ -128,10 +148,12 @@ module "dispatcher" {
   attach_policy = true
 
   environment = {
-    TASKS_TABLE           = var.tasks_table_name
-    WORK_BUCKET           = var.work_bucket_name
-    SAGEMAKER_ENDPOINTS   = local.endpoints_json
-    ACTIVE_ENDPOINT_PARAM = aws_ssm_parameter.active_endpoint.name
+    TASKS_TABLE                = var.tasks_table_name
+    WORK_BUCKET                = var.work_bucket_name
+    SAGEMAKER_ENDPOINTS        = local.endpoints_json
+    ACTIVE_ENDPOINT_PARAM      = aws_ssm_parameter.active_endpoint.name
+    WEBHOOK_QUEUE_URL          = local.webhook_queue_url
+    CUSTOMER_WEBHOOK_QUEUE_URL = local.customer_webhook_queue_url
   }
 }
 
@@ -267,6 +289,13 @@ data "aws_iam_policy_document" "sentinel" {
     actions   = ["sagemaker:InvokeEndpointAsync"]
     resources = [for e in var.endpoints : e.endpoint_arn]
   }
+
+  # QUEUED -> IN_PROGRESS promotion enqueues task.updated webhooks (queues
+  # owned by generate-pipeline).
+  statement {
+    actions   = ["sqs:SendMessage"]
+    resources = [local.webhook_queue_arn, local.customer_webhook_queue_arn]
+  }
 }
 
 module "capacity_sentinel" {
@@ -277,15 +306,15 @@ module "capacity_sentinel" {
   timeout       = 60
   memory_size   = 256
   policy_json   = data.aws_iam_policy_document.sentinel.json
-  attach_policy = true
-
   environment = {
-    TASKS_TABLE           = var.tasks_table_name
-    WORK_BUCKET           = var.work_bucket_name
-    SAGEMAKER_ENDPOINTS   = local.endpoints_json
-    ACTIVE_ENDPOINT_PARAM = aws_ssm_parameter.active_endpoint.name
-    LAST_FLIP_PARAM       = aws_ssm_parameter.last_flip.name
-    FLIP_COOLDOWN_SECONDS = "300"
+    TASKS_TABLE                = var.tasks_table_name
+    WORK_BUCKET                = var.work_bucket_name
+    SAGEMAKER_ENDPOINTS        = local.endpoints_json
+    ACTIVE_ENDPOINT_PARAM      = aws_ssm_parameter.active_endpoint.name
+    LAST_FLIP_PARAM            = aws_ssm_parameter.last_flip.name
+    FLIP_COOLDOWN_SECONDS      = "300"
+    WEBHOOK_QUEUE_URL          = local.webhook_queue_url
+    CUSTOMER_WEBHOOK_QUEUE_URL = local.customer_webhook_queue_url
   }
 }
 

@@ -10,11 +10,14 @@ const docClient = DynamoDBDocumentClient.from(new DynamoDBClient({}), {
 
 /**
  * Endpoint-idle publisher. Runs every minute (EventBridge). Queries the
- * IN_PROGRESS tasks that hold a SageMaker task token, attributes each to its
- * `sagemaker_region` (records pre-dating the multi-region refactor attribute
- * to us-east-1), and publishes an `EndpointIdle` datapoint for EVERY
- * configured endpoint: 0 if that endpoint's region has active tasks, 1 if
- * not. Busy attribution stays region-keyed BY DESIGN: with multiple
+ * IN_PROGRESS and QUEUED tasks that hold a SageMaker task token, attributes
+ * each to its `sagemaker_region` (records pre-dating the multi-region
+ * refactor attribute to us-east-1), and publishes an `EndpointIdle`
+ * datapoint for EVERY configured endpoint: 0 if that endpoint's region has
+ * active tasks, 1 if not. QUEUED counts as busy: a request waiting in
+ * SageMaker's async queue is still holding capacity intent, and marking its
+ * region idle would let scale-to-zero kill the instance it is waiting on.
+ * Busy attribution stays region-keyed BY DESIGN: with multiple
  * endpoints per region this marks every endpoint in a region with an
  * in-flight task as busy — over-conservative (delays a sibling endpoint's
  * scale-to-zero by <= one cooldown, bounded cents, never kills a
@@ -28,19 +31,25 @@ export async function handler(): Promise<{ idle: number }> {
   const regions = parseEndpointConfig(requireEnv('SAGEMAKER_ENDPOINTS'));
 
   try {
-    const result = await docClient.send(
-      new QueryCommand({
-        TableName: tableName,
-        IndexName: 'gsi2',
-        KeyConditionExpression: 'gsi2pk = :status',
-        ExpressionAttributeValues: { ':status': 'STATUS#IN_PROGRESS' },
-        FilterExpression: 'attribute_exists(sagemaker_task_token)',
-        Limit: 100,
-      }),
+    const results = await Promise.all(
+      ['STATUS#IN_PROGRESS', 'STATUS#QUEUED'].map((status) =>
+        docClient.send(
+          new QueryCommand({
+            TableName: tableName,
+            IndexName: 'gsi2',
+            KeyConditionExpression: 'gsi2pk = :status',
+            ExpressionAttributeValues: { ':status': status },
+            FilterExpression: 'attribute_exists(sagemaker_task_token)',
+            Limit: 100,
+          }),
+        ),
+      ),
     );
 
     const busyRegions = new Set(
-      (result.Items ?? []).map((item) => (item.sagemaker_region as string | undefined) ?? 'us-east-1'),
+      results
+        .flatMap((result) => result.Items ?? [])
+        .map((item) => (item.sagemaker_region as string | undefined) ?? 'us-east-1'),
     );
 
     await Promise.all(
