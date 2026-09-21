@@ -203,7 +203,7 @@ async function queryStrandedTasks(tableName: string): Promise<TaskRecord[]> {
  * QUEUED -> IN_PROGRESS promotion: a region with a live instance (current
  * >= 1) has picked the request up or is about to — SageMaker emits no
  * per-inference start event, so a running instance is the best available
- * signal. Guarded by `status = :queued` so the SageMaker callback (which sets
+ * signal. Guarded by `#status = :queued` so the SageMaker callback (which sets
  * a terminal status directly) always wins the race.
  */
 async function promoteQueuedTasksInRegion(tableName: string, region: string): Promise<number> {
@@ -227,8 +227,9 @@ async function promoteQueuedTasksInRegion(tableName: string, region: string): Pr
           TableName: tableName,
           Key: { pk: `TASK#${item.task_id}` },
           UpdateExpression:
-            'SET status = :in_progress, gsi2pk = :gsi2, updated_at = :now' +
+            'SET #status = :in_progress, gsi2pk = :gsi2, updated_at = :now' +
             (item.source === 'api' ? ', gsi4pk = :gsi4' : ''),
+          ExpressionAttributeNames: { '#status': 'status' },
           ExpressionAttributeValues: {
             ':in_progress': 'IN_PROGRESS',
             ':gsi2': 'STATUS#IN_PROGRESS',
@@ -238,7 +239,7 @@ async function promoteQueuedTasksInRegion(tableName: string, region: string): Pr
               : {}),
             ':queued': 'QUEUED',
           },
-          ConditionExpression: 'status = :queued',
+          ConditionExpression: '#status = :queued',
         }),
       );
       promoted += 1;

@@ -143,7 +143,7 @@ vi.mock('@aws-sdk/lib-dynamodb', () => ({
         }
         if (input.UpdateExpression) {
           if (
-            input.ConditionExpression === 'status = :queued' &&
+            input.ConditionExpression === '#status = :queued' &&
             input.Key?.pk !== undefined &&
             h.failUpdateForPks.has(input.Key.pk)
           ) {
@@ -441,8 +441,9 @@ describe('queued-task rescue + promotion', () => {
       expect.objectContaining({
         Key: { pk: 'TASK#01JQUEUED01' },
         UpdateExpression:
-          'SET status = :in_progress, gsi2pk = :gsi2, updated_at = :now, gsi4pk = :gsi4',
-        ConditionExpression: 'status = :queued',
+          'SET #status = :in_progress, gsi2pk = :gsi2, updated_at = :now, gsi4pk = :gsi4',
+        ExpressionAttributeNames: { '#status': 'status' },
+        ConditionExpression: '#status = :queued',
         ExpressionAttributeValues: expect.objectContaining({
           ':gsi2': 'STATUS#IN_PROGRESS',
           ':gsi4': 'USER#11111111-2222-4333-8444-555555555555#STATUS#IN_PROGRESS',
