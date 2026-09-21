@@ -162,8 +162,9 @@ watch -n 2 "curl -s $API/v1/generate/tasks/$TASK -H 'x-api-key: $KEY" | jq '{sta
 
 The real model swaps in behind the same pipeline contract (work-bucket input prefix in,
 GLB at `tasks/{task_id}/raw/model.glb` out) by setting `INFERENCE_BACKEND=sagemaker`. The
-backend is **multi-region**: the full regional stack is deployed once per candidate region,
-and a capacity sentinel elects the active region from live evidence.
+backend is **multi-region and multi-instance-type**: the full regional stack is deployed
+once per candidate region with one endpoint per chain instance type, and a capacity
+sentinel elects the active endpoint from live evidence in cold-price chain order.
 
 - **Model**: TRELLIS.2-4B (`microsoft/TRELLIS.2-4B`) is the chosen model. The inference image
   is in ECR as `trellis2image:c374e66-serve-fix`
@@ -173,18 +174,23 @@ and a capacity sentinel elects the active region from live evidence.
   candidate region — us-east-1, us-east-2, us-west-2, the only regions where SageMaker offers
   `ml.g7e.2xlarge` — each with its own provider alias (`aws.useast2`/`aws.uswest2`), S3
   input/output/weights buckets (us-east-1 keeps the legacy names; alternates gain
-  `-useast2`/`-uswest2` suffixes), Model, EndpointConfig, Endpoint, SNS topics, and
-  scale-to-zero autoscaling. A 0-instance endpoint is free, so idle candidate regions cost
-  ~nothing (weights bucket + ECR image storage only).
+  `-useast2`/`-uswest2` suffixes), and one Model/EndpointConfig/Endpoint per instance type
+  in the chain (endpoint names token-suffixed and globally unique — unsuffixed in
+  us-east-1, e.g. `...-sagemaker-g5`, region-suffixed in alternates, e.g.
+  `...-sagemaker-g5-useast2` — the sentinel elects and the dispatcher looks up
+  endpoints by NAME across the whole chain), plus SNS topics and
+  scale-to-zero autoscaling per endpoint. A 0-instance endpoint is free, so idle chain
+  endpoints cost ~nothing (weights bucket + ECR image storage only).
 - **Control plane + election** (`modules/generate-inference/sagemaker-control/`): the
   dispatcher/callback/scaler Lambdas plus a capacity-sentinel Lambda, all in us-east-1. AWS
   exposes no capacity-availability API, so the sentinel (EventBridge `rate(1 minute)`)
-  classifies every candidate region FAILED / DROUGHT / PROVISIONING / HEALTHY from
-  describe-endpoint + scaling-activity evidence and flips the `active_region` SSM parameter
-  (`/generate/{env}/sagemaker/active_region`) with a 300 s cooldown. The dispatcher reads it
-  and stages input + invokes in the active region; failback to a higher-priority region
-  happens only once that region is healthy-PROVEN; tasks stranded in an abandoned region are
-  re-dispatched automatically. See the module READMEs for the full election rules.
+  classifies every chain endpoint FAILED / DROUGHT / PROVISIONING / HEALTHY from
+  describe-endpoint + scaling-activity evidence and flips the `active_endpoint` SSM
+  parameter (`/generate/{env}/sagemaker/active_endpoint`, value = the elected endpoint's
+  NAME) with a 300 s cooldown. The dispatcher reads it and stages input + invokes on the
+  elected endpoint; failback to a higher-priority chain entry happens only once that
+  endpoint is healthy-PROVEN; tasks stranded in an abandoned region are re-dispatched
+  automatically. See the module READMEs for the full election rules.
 - **SageMaker async inference** endpoints: S3 in/out, SNS success/error topics → callback
   Lambda → `SendTaskSuccess` (the state machine's inference state becomes `.waitForTaskToken`).
   The container returns GLB bytes directly from `/invocations`; SageMaker writes them to the
@@ -192,12 +198,15 @@ and a capacity sentinel elects the active region from live evidence.
 - **Scale-to-zero**: autoscaling on `HasBacklogWithoutCapacity`, `MinCapacity = 0`,
   `MaxCapacity = 2` — multi-minute cold starts are fine for an async pipeline, in every
   candidate region.
-- **Instances**: `ml.g7e.2xlarge` (Blackwell RTX PRO 6000, 96 GB VRAM, 1,597 GB/s memory
-  bandwidth) is the primary instance — 5.1× faster and 3.4× cheaper per request than the g6e
-  fallback, and the image is compiled for sm_120 only. `ml.g6e.2xlarge` (L40S, 45 GB) is the
-  fallback and needs a multi-arch image build; `ml.g5.2xlarge` (A10G, 24 GB) is the budget
-  option but requires `low_vram = "1"`. Multi-GPU instances (g5.12x+, p4d, p5) waste all but
-  one GPU on this single-GPU-per-render workload. See
+- **Instances**: one endpoint per (region × type) with the sentinel electing by the
+  cold-price chain `ml.g5.2xlarge → ml.g6e.2xlarge → ml.g7e.2xlarge` (g5 = A10G, 24 GB,
+  $0.39/cold req; g6e = L40S, 45 GB; g7e = RTX PRO 6000, 96 GB, $0.86–0.93/cold req —
+  best warm economics at $0.067/req but Blackwell-capacity-drought-prone and priciest
+  cold). The image is multi-arch (`TORCH_CUDA_ARCH_LIST="8.0;8.6;9.0;12.0+PTX"`): one
+  image serves g5 (sm_86), g6e (sm_89), Hopper (sm_90), and g7e + the local dev box
+  (sm_120). `TRELLIS2_LOW_VRAM` is derived per type inside the sagemaker-region module
+  ("1" on g5's 24 GB, "0" on g6e/g7e). Multi-GPU instances (g5.12x+, p4d, p5) waste all
+  but one GPU on this single-GPU-per-render workload. See
   `trellis2image/docs/instance-sizing.md`.
 - **Contract**: the precise SSM parameter handoff, IAM, and resource list is in
   `trellis2image/docs/sagemaker-iac-contract.md` (this repo is app-only; Terraform lives

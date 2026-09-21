@@ -10,8 +10,9 @@ Candidate regions are fixed to the three regions where SageMaker offers
 `ml.g7e.2xlarge` (verified via the pricing API): **us-east-1, us-east-2,
 us-west-2**. The `aws.useast2` / `aws.uswest2` provider aliases in the envs are
 exact, not a shortcut. A region's stack appears when it is appended to
-`sagemaker_candidate_regions` (requires regional quota `L-5AA715AC >= 1` and
-replicated artifacts — see the add-a-region runbook in
+`sagemaker_candidate_regions` (requires the per-type endpoint-usage quota >= 1
+in that region — g5.2xlarge `L-9614C779`, g6e.2xlarge `L-F8D7F460`, g7e.2xlarge
+`L-5AA715AC` — and replicated artifacts; see the add-a-region runbook in
 `trellis2image/docs/sagemaker-iac-contract.md`).
 
 The module keeps the same pipeline contract as before the multi-region refactor:
@@ -51,26 +52,37 @@ region suffix with the region's hyphens stripped — `-useast2` / `-uswest2`
   from this region's own parameter store. In us-east-1 they are written by
   `push_image.sh` / `package_weights.sh`; in alternate regions by
   `replicate_artifacts.sh`.
-- `aws_sagemaker_model` + `aws_sagemaker_endpoint_configuration` with
-  `async_inference_config` + `aws_sagemaker_endpoint`. A `random_id` suffix on
-  the EndpointConfig name (keepers: image, weights, container environment,
-  instance type) lets image/weights changes roll forward via a new Model +
-  EndpointConfig (blue/green endpoint update) instead of a recreate that would
-  conflict with the live Endpoint. The Model and EndpointConfig depend on the
-  three buckets so their creation-time validations (model-data S3 URI,
-  execution-role `s3:ListBucket` on the output bucket) never race the bucket
-  create in a fresh region.
+- **Per-type SageMaker resources** — one `aws_sagemaker_model` +
+  `aws_sagemaker_endpoint_configuration` + `aws_sagemaker_endpoint` per
+  instance type in `var.instance_types` (`for_each`), names token-suffixed.
+  Endpoint names are globally unique — us-east-1 keeps the unsuffixed
+  legacy-style name (e.g. `${name_prefix}-sagemaker-g5`), alternate regions
+  gain a region suffix (e.g. `...-sagemaker-g5-useast2`) — because the
+  sentinel/dispatcher in `sagemaker-control` elect and look up endpoints by
+  NAME across the whole (region × type) chain; SageMaker names themselves are
+  only region-scoped. A per-type
+  `random_id` suffix on each EndpointConfig name (keepers: image, weights,
+  that type's container environment, the instance type — one random_id per
+  type so one type's change doesn't rotate the others) lets image/weights
+  changes roll forward via a new Model + EndpointConfig (blue/green endpoint
+  update) instead of a recreate that would conflict with the live Endpoint.
+  The Model and EndpointConfig depend on the three buckets so their
+  creation-time validations (model-data S3 URI, execution-role
+  `s3:ListBucket` on the output bucket) never race the bucket create in a
+  fresh region. All of a region's endpoints share that region's SNS topics
+  (the callback derives the source region from `EventSubscriptionArn`) and
+  output bucket; the variant name stays `trellis` on every endpoint.
 - **SNS success/error topics** + Lambda subscriptions. The single us-east-1
   callback Lambda (owned by `sagemaker-control`, ARN constructed by the parent
   to break the control ↔ regional reference cycle) is subscribed to both topics
   from every region — SNS cross-region Lambda delivery is supported. The
   callback derives the source region from each record's `EventSubscriptionArn`.
-- **Application Auto Scaling** on the endpoint variant with `min_capacity = 0`
-  (scale-to-zero), `max_capacity = var.max_capacity` (default 2). Scale-up on
-  `HasBacklogWithoutCapacity` (2 consecutive periods); scale-down on the custom
-  `EndpointIdle` metric (3 consecutive idle minutes) published per region by
-  the scaler Lambda in `sagemaker-control`. See
-  [Scale-to-zero](#scale-to-zero) below.
+- **Application Auto Scaling** on every endpoint variant with
+  `min_capacity = 0` (scale-to-zero), `max_capacity = var.max_capacity`
+  (default 2, per endpoint). Scale-up on `HasBacklogWithoutCapacity`
+  (2 consecutive periods); scale-down on the custom `EndpointIdle` metric
+  (3 consecutive idle minutes) published per endpoint by the scaler Lambda in
+  `sagemaker-control`. See [Scale-to-zero](#scale-to-zero) below.
 
 The SageMaker execution role is a global IAM resource owned by the parent
 module; its policy is rebuilt from the merged regional descriptors so it covers
@@ -78,9 +90,10 @@ every candidate region's buckets, topics, logs, and `trellis2image` ECR repo.
 
 ## Scale-to-zero
 
-The async endpoint scales to zero when idle, so you only pay for GPU time when
-a request is actually in flight — in every candidate region, including the idle
-ones (a 0-instance endpoint is free). Two alarms drive the autoscaling policies:
+The async endpoints scale to zero when idle, so you only pay for GPU time when
+a request is actually in flight — in every candidate region, including the
+idle ones (a 0-instance endpoint is free). Two alarms drive each endpoint's
+autoscaling policies:
 
 - **Scale-up** (`HasBacklogWithoutCapacity >= 1` for 2 min): fires when a request
   is queued with no instance to serve it. Step scaling `+1`, 300s cooldown.
@@ -88,7 +101,11 @@ ones (a 0-instance endpoint is free). Two alarms drive the autoscaling policies:
   SageMaker invocation in this region has an active `sagemaker_task_token`. Step
   scaling `-1`, 180s cooldown. `treat_missing_data = breaching` — if the scaler
   Lambda stops publishing, the alarm fires after 3 min as a safety measure
-  rather than keeping the instance alive forever.
+  rather than keeping the instance alive forever. (Busy attribution is
+  region-keyed by design: while any endpoint in the region has an in-flight
+  task, every sibling endpoint in that region also reports busy — over-
+  conservative by one cooldown at most, bounded cents, never kills a
+  mid-inference render.)
 
 ### Why a custom metric
 
@@ -97,9 +114,9 @@ request is **picked up** by the instance — not when inference **completes**.
 With short evaluation periods the scale-down alarm fires mid-inference, killing
 the instance and causing an endless scale-up/scale-down cycle that never
 completes a request. The scaler Lambda publishes a custom `EndpointIdle` metric
-every minute for every configured region; the callback Lambda clears the
-`sagemaker_task_token` after the SNS success/failure notification, so the
-metric drops to idle only after inference truly finishes.
+every minute for every configured endpoint (dimension `EndpointName`); the
+callback Lambda clears the `sagemaker_task_token` after the SNS success/failure
+notification, so the metric drops to idle only after inference truly finishes.
 
 ### Cold-run measurement
 
@@ -134,23 +151,23 @@ reads the GLB from the regional output bucket.
 
 ## Instances
 
-`ml.g7e.2xlarge` (Blackwell RTX PRO 6000, 96 GB VRAM, 1,597 GB/s memory
-bandwidth, 8 vCPU, 64 GiB RAM) is the primary instance. The image is compiled
-for sm_120 only (`TORCH_CUDA_ARCH_LIST="12.0+PTX"`); to fall back to g6e/g5,
-build a multi-arch image (`TORCH_CUDA_ARCH_LIST="8.0;8.6;9.0;12.0+PTX"
-./scripts/build_image.sh trellis2image:multiarch`) and set `instance_type` in
-the env tfvars. `ml.g6e.2xlarge` (L40S, 45 GB) is the fallback; `ml.g5.2xlarge`
-(A10G, 24 GB) is the budget option but requires `low_vram = "1"` (its 24 GB
-VRAM cannot hold all ~17 GB of models resident). Multi-GPU instances (g5.12x+,
-p4d, p5) waste all but one GPU on this single-GPU-per-render workload — see
+The module deploys **one endpoint per instance type** in
+`var.instance_types` (the parent's cold-price chain, default
+`ml.g5.2xlarge → ml.g6e.2xlarge → ml.g7e.2xlarge`; election across them is
+handled by the sentinel in `sagemaker-control`). The image is multi-arch
+(`TORCH_CUDA_ARCH_LIST="8.0;8.6;9.0;12.0+PTX"` in the trellis2image
+Dockerfile): ONE image serves g5 (A10G, 24 GB, sm_86), g6e (L40S, 45 GB,
+sm_89), Hopper (sm_90), and g7e (RTX PRO 6000, 96 GB, sm_120) plus the local
+dev box — no per-type builds. Multi-GPU instances (g5.12x+, p4d, p5) waste all
+but one GPU on this single-GPU-per-render workload — see
 `trellis2image/docs/instance-sizing.md`.
 
-The container environment sets:
+The container environment is per-type:
 
-- `TRELLIS2_LOW_VRAM` — forwarded from the `low_vram` Terraform variable
-  (default `"0"`). `"0"` loads all ~17 GB models to GPU once at startup (no
-  per-request PCIe swapping); requires >= 45 GB VRAM (g6e/g7e). `"1"` keeps
-  models on CPU and swaps per-stage (safe on g5 24 GB).
+- `TRELLIS2_LOW_VRAM` — derived per instance type inside this module
+  (replaces the old `low_vram` variable): `"1"` on `ml.g5.2xlarge` (its 24 GB
+  VRAM cannot hold all ~17 GB of models resident), `"0"` on g6e/g7e (>= 45 GB
+  loads all models to GPU once at startup — no per-request PCIe swapping).
 - `TRELLIS2_EAGER_LOAD = "1"` — loads the pipeline at container startup (before
   `/ping` returns 200) so the first request gets warm-speed latency and load
   failures surface during endpoint creation.
@@ -165,34 +182,34 @@ convention used by SageMaker.
 
 ## initial_instance_count deviation (honest note)
 
-The original design called for `initial_instance_count = 0` so a new region's
-endpoint would create `InService` at zero instances in seconds, with no
-capacity consequence at apply time. **The hashicorp/aws provider hardcodes
+The original design called for `initial_instance_count = 0` so a new endpoint
+would create `InService` at zero instances in seconds, with no capacity
+consequence at apply time. **The hashicorp/aws provider hardcodes
 `validation.IntAtLeast(1)` on `aws_sagemaker_endpoint_configuration`'s
 `initial_instance_count`, so an endpoint cannot be created at zero instances
-through Terraform.** The module therefore sets `initial_instance_count = 1`.
+through Terraform.** The module therefore sets `initial_instance_count = 1` on
+every per-type EndpointConfig.
 
 Steady-state zero still holds: `min_capacity = 0` plus the per-region
-`EndpointIdle` scale-to-zero alarm drains every region's endpoint when idle.
-The two consequences:
+`EndpointIdle` scale-to-zero alarm drains every endpoint when idle. The two
+consequences:
 
-- The **first create** of a new region's endpoint provisions one instance at
-  apply time — a one-time capacity probe. On a dry region the apply hangs
-  waiting for the instance and the endpoint may end `Failed`; recovery is
-  below.
+- The **first create** of an endpoint provisions one instance at apply time —
+  a one-time capacity probe. On a dry (type, region) the apply hangs waiting
+  for the instance and the endpoint may end `Failed`; recovery is below.
 - **UpdateEndpoint on an existing endpoint rolls the config's initial count**,
-  so an endpoint-config roll must not happen while a region is dry — it would
-  re-enter the capacity lottery. Schedule config rolls (image/weights changes)
-  for when the region is healthy, or accept that the apply waits.
+  so an endpoint-config roll must not happen while that (type, region) is dry —
+  it would re-enter the capacity lottery. Schedule config rolls (image/weights
+  changes) for when the endpoint is healthy, or accept that the apply waits.
 
 ## Failed-endpoint recovery
 
 A `Failed` endpoint never self-heals, and the capacity sentinel in
-`sagemaker-control` never elects a `Failed` region. Recovery is manual:
+`sagemaker-control` never elects a `Failed` endpoint. Recovery is manual:
 
 ```bash
 aws --profile aman-aws sagemaker delete-endpoint \
-  --region <region> --endpoint-name <name_prefix>-sagemaker
+  --region <region> --endpoint-name <name_prefix>-sagemaker-<token><-regionsuffix>   # e.g. ...-sagemaker-g5-useast2
 cd envs/<env> && AWS_PROFILE=aman-aws terraform apply   # recreates the endpoint
 ```
 

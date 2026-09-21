@@ -12,7 +12,7 @@ output "callback_lambda_arn" {
   value       = module.callback.arn
 }
 
-output "active_region_param_name" {
-  description = "SSM parameter holding the currently active SageMaker region (mutated by the sentinel at runtime)."
-  value       = aws_ssm_parameter.active_region.name
+output "active_endpoint_param_name" {
+  description = "SSM parameter holding the name of the currently active SageMaker endpoint (mutated by the sentinel at runtime)."
+  value       = aws_ssm_parameter.active_endpoint.name
 }

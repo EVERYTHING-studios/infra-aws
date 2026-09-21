@@ -9,7 +9,7 @@ variable "env" {
 }
 
 variable "region_names" {
-  description = "Static list of deployed candidate regions (us-east-1 plus sagemaker_candidate_regions). Resources that need for_each iterate over this — NOT over var.regions, whose values are known only after apply when a region's stack is being created."
+  description = "Static list of deployed candidate regions (us-east-1 plus sagemaker_candidate_regions). Resources that need for_each iterate over this — NOT over var.endpoints, whose values are known only after apply when a regional stack is being created."
   type        = list(string)
 }
 
@@ -18,18 +18,19 @@ variable "region_priority" {
   type        = list(string)
 }
 
-variable "regions" {
-  description = "Region-keyed descriptors of every candidate region's SageMaker stack (output of the parent's merged sagemaker-region instances)."
-  type = map(object({
-    region             = string
-    endpoint_name      = string
-    endpoint_arn       = string
-    input_bucket       = string
-    input_bucket_arn   = string
-    output_bucket_arn  = string
-    weights_bucket_arn = string
-    success_topic_arn  = string
-    error_topic_arn    = string
+variable "endpoints" {
+  description = "Every deployed (region x instance type) endpoint in the parent's type-major chain-priority order (coldest-cheapest type first, region priority within each type). List order = the sentinel's election + failback priority. Region-shared fields (buckets, topic ARNs) repeat per entry of the same region."
+  type = list(object({
+    region            = string
+    instance_type     = string
+    token             = string
+    endpoint_name     = string
+    endpoint_arn      = string
+    input_bucket      = string
+    input_bucket_arn  = string
+    output_bucket_arn = string
+    success_topic_arn = string
+    error_topic_arn   = string
   }))
 }
 

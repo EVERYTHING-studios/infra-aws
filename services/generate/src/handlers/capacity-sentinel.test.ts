@@ -1,5 +1,109 @@
-import { describe, expect, it } from 'vitest';
-import { classify } from './capacity-sentinel.js';
+import { beforeAll, describe, expect, it, vi } from 'vitest';
+
+// ---------------------------------------------------------------------------
+// Hoisted mock state shared with the vi.mock factories below (vitest hoists
+// vi.mock above the test body, so the factories must close over state created
+// by vi.hoisted).
+// ---------------------------------------------------------------------------
+const h = vi.hoisted(() => {
+  const now = Date.now();
+  return {
+    // endpointName -> DescribeEndpoint/DescribeScalingActivities facts
+    factsByEndpoint: {} as Record<
+      string,
+      {
+        status: string;
+        current: number;
+        desired: number;
+        activityCode?: string;
+        activityDescription?: string;
+        activityStartMinAgo?: number;
+      }
+    >,
+    // SSM parameter store (Gets read it; Puts write it)
+    ssmValues: {} as Record<string, string | undefined>,
+    now,
+  };
+});
+
+vi.mock('@aws-sdk/client-ssm', () => ({
+  SSMClient: class {
+    async send(cmd: { input: { Name?: string; Value?: string } }) {
+      if ('Value' in cmd.input && cmd.input.Name) {
+        h.ssmValues[cmd.input.Name] = cmd.input.Value;
+        return {};
+      }
+      return { Parameter: { Value: h.ssmValues[cmd.input.Name ?? ''] } };
+    }
+  },
+  GetParameterCommand: class {
+    constructor(public readonly input: { Name?: string }) {}
+  },
+  PutParameterCommand: class {
+    constructor(public readonly input: { Name?: string; Value?: string }) {}
+  },
+}));
+
+vi.mock('@aws-sdk/client-sagemaker', () => ({
+  SageMakerClient: class {
+    async send(cmd: { input: { EndpointName?: string } }) {
+      const f = h.factsByEndpoint[cmd.input.EndpointName ?? ''];
+      return {
+        EndpointStatus: f?.status ?? 'InService',
+        ProductionVariants: [
+          { CurrentInstanceCount: f?.current ?? 0, DesiredInstanceCount: f?.desired ?? 0 },
+        ],
+      };
+    }
+  },
+  DescribeEndpointCommand: class {
+    constructor(public readonly input: { EndpointName?: string }) {}
+  },
+}));
+
+vi.mock('@aws-sdk/client-application-auto-scaling', () => ({
+  ApplicationAutoScalingClient: class {
+    async send(cmd: { input: { ResourceId?: string } }) {
+      const f = Object.entries(h.factsByEndpoint).find(([name]) =>
+        cmd.input.ResourceId?.startsWith(`endpoint/${name}/variant/`),
+      )?.[1];
+      const activities =
+        f?.activityCode !== undefined
+          ? [
+              {
+                StatusCode: f.activityCode,
+                Description: f.activityDescription,
+                StartTime: new Date(h.now - (f.activityStartMinAgo ?? 0) * 60 * 1000),
+              },
+            ]
+          : [];
+      return { ScalingActivities: activities };
+    }
+  },
+  DescribeScalingActivitiesCommand: class {
+    constructor(public readonly input: { ResourceId?: string }) {}
+  },
+}));
+
+vi.mock('@aws-sdk/client-dynamodb', () => ({
+  DynamoDBClient: class {},
+}));
+
+vi.mock('@aws-sdk/lib-dynamodb', () => ({
+  DynamoDBDocumentClient: {
+    from: () => ({
+      async send() {
+        return { Items: [] };
+      },
+    }),
+  },
+  QueryCommand: class {
+    constructor(public readonly input: unknown) {}
+  },
+  UpdateCommand: class {
+    constructor(public readonly input: unknown) {}
+  },
+}));
 
 const ago = (min: number) => new Date(Date.now() - min * 60 * 1000);
 
@@ -30,5 +134,148 @@ describe('classify', () => {
   it('FAILED on a failed endpoint', () => {
     expect(classify({ status: 'Failed', current: 0, desired: 0 }))
       .toEqual({ class: 'FAILED', proven: false });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Chain election across a mixed (region x type) chain. SAGEMAKER_ENDPOINTS
+// array order is the cold-price chain: g5 -> g6e -> g7e.
+// ---------------------------------------------------------------------------
+import { classify, handler } from './capacity-sentinel.js';
+
+const CHAIN = [
+  { region: 'us-east-1', instanceType: 'g5', endpointName: 'svc-sagemaker-g5', inputBucket: 'in-g5' },
+  { region: 'us-east-1', instanceType: 'g6e', endpointName: 'svc-sagemaker-g6e', inputBucket: 'in-g6e' },
+  { region: 'us-east-1', instanceType: 'g7e', endpointName: 'svc-sagemaker-g7e', inputBucket: 'in-g7e' },
+];
+const ACTIVE_PARAM = '/generate/staging/sagemaker/active_endpoint';
+const LAST_FLIP_PARAM = '/generate/staging/sagemaker/last_flip';
+
+beforeAll(() => {
+  process.env.SAGEMAKER_ENDPOINTS = JSON.stringify(CHAIN);
+  process.env.ACTIVE_ENDPOINT_PARAM = ACTIVE_PARAM;
+  process.env.LAST_FLIP_PARAM = LAST_FLIP_PARAM;
+  process.env.TASKS_TABLE = 'tasks';
+  process.env.FLIP_COOLDOWN_SECONDS = '0';
+});
+
+describe('chain election', () => {
+  it('skips a DROUGHT head and elects the first HEALTHY entry in chain order (g5 DROUGHT, g6e HEALTHY -> g6e)', async () => {
+    h.factsByEndpoint['svc-sagemaker-g5'] = {
+      status: 'InService', current: 0, desired: 1,
+      activityCode: 'InProgress', activityStartMinAgo: 20,
+    };
+    h.factsByEndpoint['svc-sagemaker-g6e'] = {
+      status: 'InService', current: 0, desired: 0,
+      activityCode: 'Successful', activityDescription: 'Setting desired instance count to 0.',
+      activityStartMinAgo: 5,
+    };
+    h.factsByEndpoint['svc-sagemaker-g7e'] = { status: 'Failed', current: 0, desired: 0 };
+    h.ssmValues[ACTIVE_PARAM] = 'svc-sagemaker-g5';
+    h.ssmValues[LAST_FLIP_PARAM] = '1970-01-01T00:00:00.000Z';
+
+    const result = await handler();
+
+    expect(result.flipped).toBe(true);
+    expect(result.active_endpoint).toBe('svc-sagemaker-g6e');
+    expect(result.classes).toEqual({
+      'svc-sagemaker-g5': 'DROUGHT',
+      'svc-sagemaker-g6e': 'HEALTHY',
+      'svc-sagemaker-g7e': 'FAILED',
+    });
+    // The flip is recorded as the elected endpoint NAME.
+    expect(h.ssmValues[ACTIVE_PARAM]).toBe('svc-sagemaker-g6e');
+  });
+
+  it('fails back to the recovered chain head once it is healthy-proven', async () => {
+    // Continues from the previous run: active is g6e. The g5 head has since
+    // provisioned an instance (healthy + proven).
+    h.factsByEndpoint['svc-sagemaker-g5'] = { status: 'InService', current: 1, desired: 1 };
+    h.factsByEndpoint['svc-sagemaker-g6e'] = {
+      status: 'InService', current: 0, desired: 0,
+      activityCode: 'Successful', activityDescription: 'Setting desired instance count to 0.',
+      activityStartMinAgo: 5,
+    };
+    h.factsByEndpoint['svc-sagemaker-g7e'] = { status: 'Failed', current: 0, desired: 0 };
+    // active param carries over from the previous test's flip (g6e).
+
+    const result = await handler();
+
+    expect(result.flipped).toBe(true);
+    expect(result.active_endpoint).toBe('svc-sagemaker-g5');
+    expect(h.ssmValues[ACTIVE_PARAM]).toBe('svc-sagemaker-g5');
+  });
+
+  it('stays on a healthy active endpoint (no healthy sibling outranks it)', async () => {
+    h.factsByEndpoint['svc-sagemaker-g5'] = { status: 'InService', current: 1, desired: 1 };
+    h.factsByEndpoint['svc-sagemaker-g6e'] = {
+      status: 'InService', current: 0, desired: 0,
+      activityCode: 'Successful', activityDescription: 'Setting desired instance count to 0.',
+      activityStartMinAgo: 5,
+    };
+    h.factsByEndpoint['svc-sagemaker-g7e'] = { status: 'InService', current: 0, desired: 0 };
+    h.ssmValues[ACTIVE_PARAM] = 'svc-sagemaker-g5';
+
+    const result = await handler();
+
+    expect(result.flipped).toBe(false);
+    expect(result.active_endpoint).toBe('svc-sagemaker-g5');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Two-region chain: endpoint NAMES are globally unique (us-east-1 unsuffixed,
+// us-east-2 gains a -useast2 suffix — see sagemaker-region main.tf
+// region_token). The sentinel/dispatcher key every lookup on the endpoint
+// name across the whole chain, so same-type cross-region failover must
+// resolve the OTHER region's endpoint, not collapse onto the first region's
+// same-named entry (the bug this test guards against).
+// ---------------------------------------------------------------------------
+const TWO_REGION_CHAIN = [
+  { region: 'us-east-1', instanceType: 'g5', endpointName: 'svc-sagemaker-g5', inputBucket: 'in-g5-use1' },
+  { region: 'us-east-2', instanceType: 'g5', endpointName: 'svc-sagemaker-g5-useast2', inputBucket: 'in-g5-use2' },
+  { region: 'us-east-1', instanceType: 'g6e', endpointName: 'svc-sagemaker-g6e', inputBucket: 'in-g6e-use1' },
+  { region: 'us-east-2', instanceType: 'g6e', endpointName: 'svc-sagemaker-g6e-useast2', inputBucket: 'in-g6e-use2' },
+  { region: 'us-east-1', instanceType: 'g7e', endpointName: 'svc-sagemaker-g7e', inputBucket: 'in-g7e-use1' },
+  { region: 'us-east-2', instanceType: 'g7e', endpointName: 'svc-sagemaker-g7e-useast2', inputBucket: 'in-g7e-use2' },
+];
+
+describe('two-region chain election', () => {
+  it('fails over same-type across regions by unique endpoint name (g5-useast2 DROUGHT -> g5 us-east-1 HEALTHY)', async () => {
+    process.env.SAGEMAKER_ENDPOINTS = JSON.stringify(TWO_REGION_CHAIN);
+
+    // g5 in us-east-2 (the stored active) is in a capacity drought; the SAME
+    // type in us-east-1 is healthy (idle at zero, unproven). Everything else
+    // in the chain has failed.
+    h.factsByEndpoint['svc-sagemaker-g5-useast2'] = {
+      status: 'InService', current: 0, desired: 1,
+      activityCode: 'InProgress', activityStartMinAgo: 20,
+    };
+    h.factsByEndpoint['svc-sagemaker-g5'] = {
+      status: 'InService', current: 0, desired: 0,
+      activityCode: 'Successful', activityDescription: 'Setting desired instance count to 0.',
+      activityStartMinAgo: 5,
+    };
+    for (const name of [
+      'svc-sagemaker-g6e', 'svc-sagemaker-g6e-useast2',
+      'svc-sagemaker-g7e', 'svc-sagemaker-g7e-useast2',
+    ]) {
+      h.factsByEndpoint[name] = { status: 'Failed', current: 0, desired: 0 };
+    }
+    h.ssmValues[ACTIVE_PARAM] = 'svc-sagemaker-g5-useast2';
+
+    const result = await handler();
+
+    expect(result.flipped).toBe(true);
+    expect(result.active_endpoint).toBe('svc-sagemaker-g5');
+    // classes is keyed by endpoint name: 6 DISTINCT keys across 2 regions.
+    expect(Object.keys(result.classes).sort()).toEqual([
+      'svc-sagemaker-g5', 'svc-sagemaker-g5-useast2',
+      'svc-sagemaker-g6e', 'svc-sagemaker-g6e-useast2',
+      'svc-sagemaker-g7e', 'svc-sagemaker-g7e-useast2',
+    ].sort());
+    expect(result.classes['svc-sagemaker-g5-useast2']).toBe('DROUGHT');
+    expect(result.classes['svc-sagemaker-g5']).toBe('HEALTHY');
+    expect(h.ssmValues[ACTIVE_PARAM]).toBe('svc-sagemaker-g5');
   });
 });

@@ -2,13 +2,15 @@
 #
 # The default backend is the stub Lambda: it simulates a model run and emits a
 # fixture GLB at the pipeline contract location (tasks/{task_id}/raw/model.glb
-# in the work bucket). The SageMaker async-inference backend is
-# multi-region: the full regional stack (buckets, Model/EndpointConfig/
-# Endpoint, SNS topics, autoscaling) is deployed once per candidate region in
-# `sagemaker-region/`, and a single us-east-1 control plane (`sagemaker-control/`)
-# runs the dispatcher/callback/scaler/capacity-sentinel Lambdas and elects the
-# active region from live capacity evidence — see sagemaker-region/README.md
-# and sagemaker-control/README.md.
+# in the work bucket). The SageMaker async-inference backend is multi-region
+# AND multi-instance-type: the full regional stack (buckets, per-type
+# Model/EndpointConfig/Endpoint sets, SNS topics, autoscaling) is deployed once
+# per candidate region in `sagemaker-region/` — one endpoint per instance type
+# in the cold-price chain — and a single us-east-1 control plane
+# (`sagemaker-control/`) runs the dispatcher/callback/scaler/capacity-sentinel
+# Lambdas and elects the active endpoint from live capacity evidence, in chain
+# order (type-major, region-minor) — see sagemaker-region/README.md and
+# sagemaker-control/README.md.
 #
 # Candidate regions are fixed to the three regions where SageMaker offers
 # ml.g7e.2xlarge (us-east-1, us-east-2, us-west-2); the provider aliases
@@ -121,6 +123,39 @@ locals {
     try(module.sagemaker_region_useast2[0].this, {}),
     try(module.sagemaker_region_uswest2[0].this, {}),
   )
+
+  # Instance-type name tokens (must mirror sagemaker-region's type_token map;
+  # consistency is enforced by the shared allowed-values validation on
+  # sagemaker_instance_types / instance_types).
+  type_tokens = {
+    "ml.g5.2xlarge"  = "g5"
+    "ml.g6e.2xlarge" = "g6e"
+    "ml.g7e.2xlarge" = "g7e"
+  }
+
+  # Endpoint election priority — TYPE-MAJOR: for each instance type in
+  # var.sagemaker_instance_types order (cold-price chain: g5 -> g6e -> g7e),
+  # each region in region_priority order. Prices are region-invariant, so
+  # the cheapest type in any region beats a pricier type in the preferred
+  # region. Entries whose (region, type) endpoint is absent (gated/absent
+  # region) drop out via the null filter; try() absorbs missing keys.
+  endpoint_priority = [
+    for e in flatten([
+      for t in var.sagemaker_instance_types : [
+        for r in local.region_priority : {
+          region            = r
+          instance_type     = t
+          token             = local.type_tokens[t]
+          endpoint_name     = try(local.sagemaker_regions[r].endpoints[local.type_tokens[t]].name, null)
+          endpoint_arn      = try(local.sagemaker_regions[r].endpoints[local.type_tokens[t]].arn, null)
+          input_bucket      = try(local.sagemaker_regions[r].input_bucket, null)
+          input_bucket_arn  = try(local.sagemaker_regions[r].input_bucket_arn, null)
+          success_topic_arn = try(local.sagemaker_regions[r].success_topic_arn, null)
+          error_topic_arn   = try(local.sagemaker_regions[r].error_topic_arn, null)
+        }
+      ]
+    ]) : e if e.endpoint_name != null
+  ]
 }
 
 data "aws_iam_policy_document" "sagemaker_execution_static" {
@@ -204,8 +239,7 @@ module "sagemaker_region_useast1" {
   execution_role_arn    = aws_iam_role.sagemaker_execution.arn
   callback_function_arn = local.callback_function_arn
   bucket_names          = local.region_bucket_names["us-east-1"]
-  instance_type         = var.instance_type
-  low_vram              = var.low_vram
+  instance_types        = var.sagemaker_instance_types
   max_capacity          = var.sagemaker_max_capacity
 
   # Orders each regional Model create after the execution-role policy attach
@@ -228,8 +262,7 @@ module "sagemaker_region_useast2" {
   execution_role_arn    = aws_iam_role.sagemaker_execution.arn
   callback_function_arn = local.callback_function_arn
   bucket_names          = local.region_bucket_names["us-east-2"]
-  instance_type         = var.instance_type
-  low_vram              = var.low_vram
+  instance_types        = var.sagemaker_instance_types
   max_capacity          = var.sagemaker_max_capacity
 
   # See the useast1 block: orders Model create after the policy attach.
@@ -248,8 +281,7 @@ module "sagemaker_region_uswest2" {
   execution_role_arn    = aws_iam_role.sagemaker_execution.arn
   callback_function_arn = local.callback_function_arn
   bucket_names          = local.region_bucket_names["us-west-2"]
-  instance_type         = var.instance_type
-  low_vram              = var.low_vram
+  instance_types        = var.sagemaker_instance_types
   max_capacity          = var.sagemaker_max_capacity
 
   # See the useast1 block: orders Model create after the policy attach.
@@ -259,9 +291,9 @@ module "sagemaker_region_uswest2" {
 # ------------------------------------------------------------------
 # Control plane (once, us-east-1): dispatcher/callback/scaler/sentinel
 # Lambdas, the EventBridge rule, SNS invoke permissions for every region's
-# topics, and the active_region/last_flip election parameters. Consumes the
-# merged regional descriptors, so its IAM and env wiring cover every
-# candidate region.
+# topics, and the active_endpoint/last_flip election parameters. Consumes
+# the type-major endpoint priority list, so its IAM and env wiring cover
+# every (region x instance type) endpoint in the chain.
 # ------------------------------------------------------------------
 
 module "sagemaker_control" {
@@ -272,7 +304,7 @@ module "sagemaker_control" {
   env               = var.env
   region_names      = local.region_names
   region_priority   = local.region_priority
-  regions           = local.sagemaker_regions
+  endpoints         = local.endpoint_priority
   tasks_table_name  = var.tasks_table_name
   tasks_table_arn   = var.tasks_table_arn
   work_bucket_name  = var.work_bucket_name

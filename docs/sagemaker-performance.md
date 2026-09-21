@@ -13,16 +13,24 @@ staging (`us-east-1`, `AWS_PROFILE=aman-aws`). All measurements use
 | `ml.g5.2xlarge` | A10G | 24 GB | 8 | 32 GiB | $1.52 |
 
 All are single-GPU instances; multi-GPU instances (g5.12x+, p4d, p5) waste all
-but one GPU on this single-GPU-per-render workload. The current deployment
-targets `ml.g7e.2xlarge` (Blackwell RTX PRO 6000, sm_120) as the primary
-instance — 1.85× the memory bandwidth of g6e's L40S (1,597 vs 864 GB/s) with
-96 GB VRAM. The image is compiled for sm_120 only. The g6e.2xlarge (L40S) is
-the fallback (requires a multi-arch image build); g5.2xlarge (A10G) is the
-budget option but requires `low_vram="1"` (its 24 GB VRAM cannot hold all
-~17 GB of models resident). `ml.g7.2xlarge` (RTX PRO 4500 Blackwell, $3.15/hr)
-is **not recommended** — its memory bandwidth (~800 GB/s) is *lower* than
-g6e's L40S (864 GB/s) while costing more per hour, making it a cost-per-request
-regression (see § ml.g7e.2xlarge below for the analysis).
+but one GPU on this single-GPU-per-render workload. The deployment now runs
+**one endpoint per (region × instance type)** with a capacity sentinel electing
+by the **cold-price chain `g5 → g6e → g7e`** (measured cold-cycle costs:
+$0.39 / ~$0.70 est / $0.86–0.93 per cold request — see the per-instance
+sections below). For this scale-to-zero endpoint cold cost dominates, so the
+cheapest cold cycle wins even though g7e's warm cost ($0.067/req) is 10×
+cheaper — g7e serves only when g5 AND g6e are both unavailable (Blackwell
+capacity droughts made g7e the risky head; us-east-1 was dry all day
+2026-09-17). The image is **multi-arch**
+(`TORCH_CUDA_ARCH_LIST="8.0;8.6;9.0;12.0+PTX"`, bundle `precision-v1.1`):
+one image serves g5 (sm_86), g6e (sm_89), Hopper (sm_90), and g7e + the
+local dev box (sm_120) — no per-type builds. `TRELLIS2_LOW_VRAM` is derived
+per type in the sagemaker-region module: `"1"` on g5's 24 GB (cannot hold all
+~17 GB of models resident), `"0"` on g6e/g7e. `ml.g7.2xlarge` (RTX PRO 4500
+Blackwell, $3.15/hr) is **not recommended** — its memory bandwidth
+(~800 GB/s) is *lower* than g6e's L40S (864 GB/s) while costing more per
+hour, making it a cost-per-request regression (see § ml.g7e.2xlarge below
+for the analysis).
 
 ## Methodology
 
@@ -350,15 +358,16 @@ representative, not a single-run artifact.
 2. **Batching**: cold start + cooldown dominate a single-request cold run
    (100% idle fraction). Submitting a second request while the instance is
    warm eliminates its cold-start cost entirely.
-3. **Instance selection**: g7e.2xlarge is the primary instance (1.85× bandwidth
-   of g6e, 96 GB VRAM). G6e.2xlarge is the fallback (requires a multi-arch
-   image). G5.2xlarge is the budget option (requires `low_vram="1"`). G7e
-   wins on cost-per-request when its speedup is ≥1.5× vs g6e; if <1.5×, revert
-   to g6e.
-4. **low_vram=False**: on ≥45 GB VRAM instances (g6e, g7e), loads all ~17 GB
-   of models to GPU once at startup, eliminating per-request CPU↔GPU swapping
-   (8+ PCIe round-trips of ~2.5 GB). The single biggest warm-inference win.
-   Not safe on g5 (24 GB) — set `low_vram="1"`.
+3. **Instance selection (chain)**: the cold-price chain g5 → g6e → g7e is
+   deployed as one endpoint per (region × type) and elected by the sentinel
+   (see "Instance types" above). One multi-arch image serves all three —
+   no per-type builds. g7e keeps the best warm economics ($0.067/req,
+   1.85× g6e bandwidth, 96 GB VRAM) but the priciest cold cycle.
+4. **low_vram derived per type**: on ≥45 GB VRAM instances (g6e, g7e), the
+   module sets `low_vram="0"` — loads all ~17 GB of models to GPU once at
+   startup, eliminating per-request CPU↔GPU swapping (8+ PCIe round-trips
+   of ~2.5 GB). The single biggest warm-inference win. Not safe on g5
+   (24 GB) — the module sets `low_vram="1"` there.
 5. **Selective model loading**: the unused `tex_slat_flow_model_512` (~2.5 GB)
    is excluded from both the loaded models and the packaged weights tar,
    shrinking the artifact from ~13.3 GB to ~10.8 GB and speeding the S3

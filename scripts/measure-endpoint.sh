@@ -260,13 +260,15 @@ if [ -n "$TASK_ID" ]; then
   echo "Task wall-clock:    ${task_wall_s}s ($task_status)"
 fi
 
-# Estimated cost
+# Estimated cost. INSTANCE_TYPE (default ml.g6e.2xlarge) + AWS_DEFAULT_REGION
+# select the pricing-API lookup; RATE overrides the lookup entirely.
+INSTANCE_TYPE="${INSTANCE_TYPE:-ml.g6e.2xlarge}"
 if [ -z "$RATE" ]; then
   RATE=$($AWS pricing get-products \
     --service-code AmazonSageMaker \
-    --filters 'Type=TERM_MATCH,Field=instanceType,Value=ml.g5.2xlarge' \
+    --filters "Type=TERM_MATCH,Field=instanceType,Value=${INSTANCE_TYPE}" \
               'Type=TERM_MATCH,Field=productfamily,Value=ML Instance' \
-              'Type=TERM_MATCH,Field=regionCode,Value=us-east-1' \
+              "Type=TERM_MATCH,Field=regionCode,Value=${AWS_DEFAULT_REGION:-us-east-1}" \
     --max-results 1 \
     --query 'PriceList[0]' --output text 2>/dev/null \
     | jq -r '.terms.OnDemand | to_entries[0].value.priceDimensions | to_entries[0].value.pricePerUnit.USD // empty' 2>/dev/null || true)

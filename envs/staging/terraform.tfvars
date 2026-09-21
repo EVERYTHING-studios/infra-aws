@@ -12,23 +12,32 @@ cloudfront_distribution_id = ""
 inference_backend = "sagemaker"
 postprocess_mode  = "lite"
 
-# SageMaker instance type: ml.g7e.2xlarge (Blackwell RTX PRO 6000, 96 GB VRAM,
-# 1597 GB/s — 1.85x the memory bandwidth of g6e's L40S). The image is compiled
-# for sm_120 only; to fall back to g6e/g5, build a multi-arch image
-# (TORCH_CUDA_ARCH_LIST="8.0;8.6;9.0;12.0+PTX") and set this to ml.g6e.2xlarge.
-# low_vram="0" loads all ~17 GB models to GPU once (safe on 96 GB VRAM).
-instance_type = "ml.g7e.2xlarge"
-low_vram      = "0"
+# SageMaker instance-type chain: one endpoint per (region x type); the
+# capacity sentinel elects the first HEALTHY endpoint in this order.
+# Chain = cold-cycle price order (g5 $0.39 -> g6e ~$0.70 -> g7e $0.86-0.93
+# per cold request; see trellis2image/docs/instance-sizing.md). The image is
+# multi-arch (sm_80/86/90/120) — no per-type build. low_vram is derived per
+# type inside the sagemaker-region module ("1" on g5's 24 GB, "0" elsewhere).
+sagemaker_instance_types = ["ml.g5.2xlarge", "ml.g6e.2xlarge", "ml.g7e.2xlarge"]
 
-# Endpoint autoscaling max. Quota L-5AA715AC (=2) is shared between envs;
-# 1 + 1 fits without a quota increase. Bump after the quota request lands.
+# Endpoint autoscaling max. Per-type endpoint-usage quotas (checked 2026-09-19):
+# g5.2xlarge L-9614C779 = 2, g6e.2xlarge L-F8D7F460 = 1, g7e.2xlarge
+# L-5AA715AC = 4 in us-east-1 / 2 in us-east-2. 1 + 1 (staging + production)
+# fits g5 and g7e; g6e quota = 1 per region means the two envs' g6e endpoints
+# cannot both hold an instance at once in one region — apply staging first,
+# let its endpoints scale to zero, then production (a Failed create from the
+# quota race just needs delete-endpoint + re-apply).
 sagemaker_max_capacity = 1
 
 # Multi-region capacity: alternate regions with replicated artifacts
-# (image/weights) and their own SageMaker endpoint. Sentinel fails over to a
-# HEALTHY candidate when the active region is in a capacity drought. List
-# order = sentinel failback priority (us-east-2 first: only region with
-# demonstrated capacity as of 2026-09-17; us-east-1 was capacity-dry all day).
+# (image/weights) and their own per-type SageMaker endpoints. Region order
+# here = region priority WITHIN each chain type (type-major election: see
+# modules/generate-inference/README + sagemaker-control). us-east-1 first:
+# the chain head is g5 (mature Ampere capacity, quota 2 in both regions)
+# and same-region dispatch with the us-east-1 control plane avoids
+# cross-region input/GLB copies; the earlier us-east-2-first rationale
+# (g7e Blackwell drought in us-east-1) applied to a g7e head, not a g5 head.
+# On a drought the sentinel fails over within ~1 minute automatically.
 # us-west-2 deferred after a second failed probe on 2026-09-17: quota
 # L-5AA715AC = 2.0 there, but create-endpoint hit InsufficientInstanceCapacity
 # twice in the morning and again after ~31 min of retrying in the afternoon.
@@ -36,4 +45,4 @@ sagemaker_max_capacity = 1
 # place. To retry later: append "us-west-2", targeted-apply its buckets/SSM
 # (already exist), re-run replicate_artifacts.sh with
 # REPLICATE_REGIONS="us-west-2", then full apply.
-sagemaker_candidate_regions = ["us-east-2", "us-east-1"]
+sagemaker_candidate_regions = ["us-east-1", "us-east-2"]
