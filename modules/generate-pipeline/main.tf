@@ -276,11 +276,11 @@ resource "aws_cloudwatch_event_target" "execution_status" {
 }
 
 resource "aws_lambda_permission" "execution_status" {
-  statement_id   = "AllowExecutionStatusWatchInvoke"
-  action         = "lambda:InvokeFunction"
-  function_name  = module.execution_status_watch.function_name
-  principal      = "events.amazonaws.com"
-  source_arn     = aws_cloudwatch_event_rule.execution_status.arn
+  statement_id  = "AllowExecutionStatusWatchInvoke"
+  action        = "lambda:InvokeFunction"
+  function_name = module.execution_status_watch.function_name
+  principal     = "events.amazonaws.com"
+  source_arn    = aws_cloudwatch_event_rule.execution_status.arn
 }
 
 data "aws_iam_policy_document" "webhook_dispatch" {

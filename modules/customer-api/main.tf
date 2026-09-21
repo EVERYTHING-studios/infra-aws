@@ -158,7 +158,7 @@ module "webhook_endpoint" {
   attach_policy = true
 
   environment = {
-    ACCOUNTS_TABLE            = aws_dynamodb_table.accounts.name
+    ACCOUNTS_TABLE             = aws_dynamodb_table.accounts.name
     CUSTOMER_WEBHOOK_QUEUE_URL = var.customer_webhook_queue_url
   }
 }

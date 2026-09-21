@@ -228,8 +228,8 @@ module "customer_api" {
   tasks_table_name   = module.tasks.table_name
   tasks_table_arn    = module.tasks.table_arn
   state_machine_arn  = module.pipeline.state_machine_arn
-  work_bucket_name = aws_s3_bucket.work.bucket
-  work_bucket_arn  = aws_s3_bucket.work.arn
+  work_bucket_name   = aws_s3_bucket.work.bucket
+  work_bucket_arn    = aws_s3_bucket.work.arn
 
   customer_webhook_queue_url = module.pipeline.customer_webhook_queue_url
   customer_webhook_queue_arn = module.pipeline.customer_webhook_queue_arn
