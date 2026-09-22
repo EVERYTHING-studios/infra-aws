@@ -4,8 +4,8 @@
 *.tfstate.*
 *.tfplan
 *.tfplan.*
-tfplan
-tfplan*.bin
+tfplan*
+modules/**/.terraform.lock.hcl
 crash.log
 
 # Lambda build output
