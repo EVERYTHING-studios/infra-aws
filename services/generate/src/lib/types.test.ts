@@ -34,6 +34,8 @@ describe('toApiTask', () => {
     expect(toApiTask(record)).not.toHaveProperty('source');
     expect(toApiTask(record)).not.toHaveProperty('inference_started_at');
     expect(toApiTask(record)).not.toHaveProperty('inference_finished_at');
+    expect(toApiTask(record)).not.toHaveProperty('capacity_started_at');
+    expect(toApiTask(record)).not.toHaveProperty('inference_instance_type');
   });
 
   it('passes through outputs when present', () => {

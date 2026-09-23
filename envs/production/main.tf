@@ -71,6 +71,10 @@ locals {
   # Shared *.everythingstudios.ai wildcard cert + zone (same as the web-app's SST stack).
   hosted_zone_id  = "Z01141872JPDWNBE74RD0"
   certificate_arn = "arn:aws:acm:us-east-1:095256591532:certificate/ba84a0d5-7004-487f-a7fb-f89f20117f21"
+
+  # API usage billing (single source for pipeline + customer_api — no drift).
+  billing_rates_json    = jsonencode({ g5 = 844, g6e = 1556, g7e = 2333 })
+  min_balance_micro_usd = 1000000
 }
 
 # ------------------------------------------------------------------
@@ -185,6 +189,7 @@ module "pipeline" {
   postprocess_mode           = var.postprocess_mode
   vpc_id                     = var.vpc_id
   subnet_ids                 = var.subnet_ids
+  billing_rates_json         = local.billing_rates_json
 }
 
 module "api_gateway" {
@@ -229,4 +234,6 @@ module "customer_api" {
 
   customer_webhook_queue_url = module.pipeline.customer_webhook_queue_url
   customer_webhook_queue_arn = module.pipeline.customer_webhook_queue_arn
+  billing_rates_json         = local.billing_rates_json
+  min_balance_micro_usd      = local.min_balance_micro_usd
 }

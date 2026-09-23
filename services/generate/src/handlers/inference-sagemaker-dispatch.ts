@@ -62,6 +62,7 @@ export async function handler(event: DispatchInput): Promise<{ dispatched: true 
     sagemaker_region: conf.region,
     progress: 25,
     inference_started_at: new Date().toISOString(),
+    inference_instance_type: conf.instanceType,
   });
 
   await enqueueWebhook(updated);

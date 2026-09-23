@@ -52,3 +52,13 @@ variable "customer_webhook_queue_url" {
 variable "customer_webhook_queue_arn" {
   type = string
 }
+
+variable "billing_rates_json" {
+  description = "JSON map of instance type -> micro-USD per second (2x margin)."
+  type        = string
+}
+
+variable "min_balance_micro_usd" {
+  description = "Minimum prepay balance (micro-USD) required to start a job."
+  type        = number
+}

@@ -73,6 +73,8 @@ export interface EndpointFacts {
   latestActivityStatusCode?: string;
   latestActivityDescription?: string;
   latestActivityStart?: Date;
+  /** Most recent successful scale-out activity start ("to N", N >= 1) — capacity-allocation signal for billing. */
+  scaleUpStart?: Date;
 }
 
 async function describeRegion(conf: EndpointConfig): Promise<EndpointFacts> {
@@ -104,6 +106,11 @@ async function describeRegion(conf: EndpointConfig): Promise<EndpointFacts> {
     latestActivityStatusCode: latest?.StatusCode,
     latestActivityDescription: latest?.Description,
     latestActivityStart: latest?.StartTime,
+    scaleUpStart: sorted.find(
+      (a) =>
+        a.StatusCode === 'Successful' &&
+        Number(a.Description?.match(/to (\d+)/)?.[1] ?? 0) >= 1,
+    )?.StartTime,
   };
 }
 
@@ -206,7 +213,11 @@ async function queryStrandedTasks(tableName: string): Promise<TaskRecord[]> {
  * signal. Guarded by `#status = :queued` so the SageMaker callback (which sets
  * a terminal status directly) always wins the race.
  */
-async function promoteQueuedTasksInRegion(tableName: string, region: string): Promise<number> {
+async function promoteQueuedTasksInRegion(
+  tableName: string,
+  region: string,
+  scaleUpStart?: Date,
+): Promise<number> {
   const queued = await docClient.send(
     new QueryCommand({
       TableName: tableName,
@@ -221,19 +232,29 @@ async function promoteQueuedTasksInRegion(tableName: string, region: string): Pr
   let promoted = 0;
   for (const item of (queued.Items ?? []) as TaskRecord[]) {
     const now = new Date().toISOString();
+    // Billing window start: the latest successful scale-out (cold boot) or
+    // the dispatch time (warm instance), whichever is later — never a
+    // pre-launch queue wait. No scale-out fact (or no dispatch stamp):
+    // poll time — customer-favoring, at most one poll underbilled.
+    const dispatchMs = item.inference_started_at ? Date.parse(item.inference_started_at) : NaN;
+    const capacityStartedAt =
+      scaleUpStart && Number.isFinite(dispatchMs)
+        ? new Date(Math.max(scaleUpStart.getTime(), dispatchMs)).toISOString()
+        : now;
     try {
       await docClient.send(
         new UpdateCommand({
           TableName: tableName,
           Key: { pk: `TASK#${item.task_id}` },
           UpdateExpression:
-            'SET #status = :in_progress, gsi2pk = :gsi2, updated_at = :now' +
+            'SET #status = :in_progress, gsi2pk = :gsi2, updated_at = :now, capacity_started_at = :capacity' +
             (item.source === 'api' ? ', gsi4pk = :gsi4' : ''),
           ExpressionAttributeNames: { '#status': 'status' },
           ExpressionAttributeValues: {
             ':in_progress': 'IN_PROGRESS',
             ':gsi2': 'STATUS#IN_PROGRESS',
             ':now': now,
+            ':capacity': capacityStartedAt,
             ...(item.source === 'api'
               ? { ':gsi4': `USER#${item.user_id}#STATUS#IN_PROGRESS` }
               : {}),
@@ -281,11 +302,16 @@ export async function handler(): Promise<{
   }
 
   // Classify every chain endpoint, preserving configured order.
+  // Latest successful scale-out start per endpoint — from the same
+  // DescribeScalingActivities facts used for classification. Feeds the
+  // capacity_started_at billing stamp on QUEUED->IN_PROGRESS promotion.
+  const scaleUpStartByEndpoint: Record<string, Date | undefined> = {};
   const states: EndpointState[] = [];
   for (const conf of configs) {
     const facts = await describeRegion(conf);
     const { class: cls, proven } = classify(facts);
     states.push({ conf, class: cls, proven, current: facts.current });
+    scaleUpStartByEndpoint[conf.endpointName] = facts.scaleUpStart;
   }
   const classes: Record<string, RegionClass> = {};
   for (const s of states) classes[s.conf.endpointName] = s.class;
@@ -366,7 +392,11 @@ export async function handler(): Promise<{
   const tableForPromotion = requireEnv('TASKS_TABLE');
   for (const s of states) {
     if (s.class !== 'HEALTHY' || s.current < 1) continue;
-    promoted += await promoteQueuedTasksInRegion(tableForPromotion, s.conf.region);
+    promoted += await promoteQueuedTasksInRegion(
+      tableForPromotion,
+      s.conf.region,
+      scaleUpStartByEndpoint[s.conf.endpointName],
+    );
   }
 
   return { active_endpoint: activeEndpoint, flipped, classes, rescued, promoted };
