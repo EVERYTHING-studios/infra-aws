@@ -1,9 +1,14 @@
-import { DynamoDBClient, ConditionalCheckFailedException } from '@aws-sdk/client-dynamodb';
+import {
+  DynamoDBClient,
+  ConditionalCheckFailedException,
+  TransactionCanceledException,
+} from '@aws-sdk/client-dynamodb';
 import {
   DynamoDBDocumentClient,
   GetCommand,
   PutCommand,
   QueryCommand,
+  TransactWriteCommand,
   UpdateCommand,
 } from '@aws-sdk/lib-dynamodb';
 import { requireEnv } from './env.js';
@@ -13,10 +18,14 @@ import { requireEnv } from './env.js';
  *
  * Item layout (pk-partitioned, single table):
  *   pk = USER#{user_id}:  { user_id, display_name?, webhook_url?, webhook_secret?,
- *                          created_at, updated_at }
+ *                          balance_micro_usd?, created_at, updated_at }
  *   pk = KEY#{key_id}:    { key_id, user_id, key_hash, label, status, created_at,
  *                          last_used_at? }
  *                          + gsi1pk = USER#{user_id}#KEYS, gsi1sk = created_at
+ *   pk = LEDGER#{idem}:   { idem, user_id, kind, amount_micro_usd, task_id?,
+ *                          instance_type?, seconds?, description?, created_at }
+ *                          + gsi1pk = USER#{user_id}#LEDGER, gsi1sk = created_at
+ *                          (financial record — no TTL, ever)
  */
 
 export interface AccountItem {
@@ -24,8 +33,26 @@ export interface AccountItem {
   display_name?: string;
   webhook_url?: string;
   webhook_secret?: string;
+  /** Prepay balance in micro-USD (1e-6 USD); absent = 0. */
+  balance_micro_usd?: number;
   created_at: string;
   updated_at: string;
+}
+
+export type LedgerKind = 'usage' | 'topup' | 'admin';
+
+export interface LedgerItem {
+  /** Idempotency token: usage:{task_id} | topup:{stripe_session_id} | admin:{ulid}. */
+  idem: string;
+  user_id: string;
+  kind: LedgerKind;
+  /** Signed micro-USD; usage entries are negative. */
+  amount_micro_usd: number;
+  task_id?: string;
+  instance_type?: string;
+  seconds?: number;
+  description?: string;
+  created_at: string;
 }
 
 export type ApiKeyStatus = 'active' | 'revoked';
@@ -88,6 +115,124 @@ export async function getAccount(userId: string): Promise<AccountItem | null> {
     new GetCommand({ TableName: requireEnv('ACCOUNTS_TABLE'), Key: userPk(userId) }),
   );
   return (result.Item as AccountItem | undefined) ?? null;
+}
+
+/** Prepay balance in micro-USD; absent account row or attribute reads as 0. */
+export async function getBalance(userId: string): Promise<number> {
+  const account = await getAccount(userId);
+  return account?.balance_micro_usd ?? 0;
+}
+
+export interface LedgerEntryMeta {
+  task_id?: string;
+  instance_type?: string;
+  seconds?: number;
+  description?: string;
+}
+
+/**
+ * Apply one signed ledger entry and move the balance atomically
+ * (TransactWriteItems). Idempotent by ledger pk: a repeat with the same
+ * `idem` (webhook redelivery / Lambda retry) returns `{ already_applied: true }`
+ * instead of double-applying.
+ *
+ * Callers guarantee the USER#{user_id} row exists — the account update is
+ * conditioned on `attribute_exists(pk)` so a missing row can never silently
+ * create a balance-only zombie item.
+ */
+export async function applyLedgerEntry(
+  userId: string,
+  amountMicroUsd: number,
+  idem: string,
+  kind: LedgerKind,
+  meta: LedgerEntryMeta = {},
+): Promise<{ already_applied?: boolean }> {
+  const now = new Date().toISOString();
+  try {
+    await client.send(
+      new TransactWriteCommand({
+        TransactItems: [
+          {
+            Put: {
+              TableName: requireEnv('ACCOUNTS_TABLE'),
+              Item: {
+                pk: `LEDGER#${idem}`,
+                idem,
+                user_id: userId,
+                kind,
+                amount_micro_usd: amountMicroUsd,
+                task_id: meta.task_id,
+                instance_type: meta.instance_type,
+                seconds: meta.seconds,
+                description: meta.description,
+                created_at: now,
+                gsi1pk: `USER#${userId}#LEDGER`,
+                gsi1sk: now,
+              },
+              ConditionExpression: 'attribute_not_exists(pk)',
+            },
+          },
+          {
+            Update: {
+              TableName: requireEnv('ACCOUNTS_TABLE'),
+              Key: userPk(userId),
+              UpdateExpression:
+                'SET balance_micro_usd = if_not_exists(balance_micro_usd, :zero) + :delta, updated_at = :now',
+              ExpressionAttributeValues: {
+                ':zero': 0,
+                ':delta': amountMicroUsd,
+                ':now': now,
+              },
+              ConditionExpression: 'attribute_exists(pk)',
+            },
+          },
+        ],
+      }),
+    );
+    return {};
+  } catch (err) {
+    if (err instanceof TransactionCanceledException) {
+      const reasons = (err.CancellationReasons ?? []) as { Code?: string }[];
+      if (reasons[0]?.Code === 'ConditionalCheckFailed') {
+        // Ledger pk already exists — this exact entry was applied before.
+        return { already_applied: true };
+      }
+      if (reasons[1]?.Code === 'ConditionalCheckFailed') {
+        throw new NotFoundError(`account ${userId} not found`);
+      }
+    }
+    throw err;
+  }
+}
+
+export interface LedgerPage {
+  items: LedgerItem[];
+  lastEvaluatedKey?: string;
+}
+
+/** Newest-first ledger page for a user (gsi1: USER#{user_id}#LEDGER by created_at). */
+export async function listLedgerByUser(
+  userId: string,
+  limit = 20,
+  cursor?: string,
+): Promise<LedgerPage> {
+  const result = await client.send(
+    new QueryCommand({
+      TableName: requireEnv('ACCOUNTS_TABLE'),
+      IndexName: 'gsi1',
+      KeyConditionExpression: 'gsi1pk = :pk',
+      ExpressionAttributeValues: { ':pk': `USER#${userId}#LEDGER` },
+      ScanIndexForward: false,
+      Limit: limit,
+      ...(cursor ? { ExclusiveStartKey: JSON.parse(Buffer.from(cursor, 'base64url').toString('utf8')) } : {}),
+    }),
+  );
+  return {
+    items: (result.Items ?? []) as LedgerItem[],
+    ...(result.LastEvaluatedKey
+      ? { lastEvaluatedKey: Buffer.from(JSON.stringify(result.LastEvaluatedKey)).toString('base64url') }
+      : {}),
+  };
 }
 
 export async function putApiKey(item: ApiKeyItem): Promise<void> {

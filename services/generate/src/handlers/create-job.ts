@@ -9,6 +9,7 @@ import {
   ttlFromNow,
   updateTask,
 } from '../lib/tasks-repo.js';
+import { getBalance } from '../lib/accounts-repo.js';
 import { TaskRecord } from '../lib/types.js';
 import { json, errorResponse, authorizerUserId } from '../lib/http.js';
 import { requireEnv } from '../lib/env.js';
@@ -20,10 +21,10 @@ const sfn = new SFNClient({});
  * POST /v1/jobs — customer API render job creation. Mirrors create-task but:
  *  - user identity comes from the customer authorizer context (per-user key),
  *  - output hints are synthesized (job_id = fresh ULID), never client-chosen,
- *  - idempotency is scoped per user,
  *  - the task is marked source: 'api' so listings/webhooks route to the
  *    customer surfaces. API jobs do not consume credits and create no
- *    Supabase rows — usage billing is future work.
+ *    Supabase rows — usage is billed per second against the prepay balance
+ *    (billing.ts; minimum-balance gate below, settlement in finalize).
  */
 export async function handler(event: APIGatewayProxyEventV2): Promise<APIGatewayProxyResultV2> {
   const userId = authorizerUserId(event);
@@ -50,6 +51,23 @@ export async function handler(event: APIGatewayProxyEventV2): Promise<APIGateway
     if (existing) {
       return json(202, { job_id: existing.task_id });
     }
+  }
+
+  // Minimum prepay balance gate. After the idempotency check so replays of
+  // an already-created job still return 202 regardless of current balance.
+  // Settlement may still drive the balance negative (overdraft accepted);
+  // this gate only blocks starting new jobs below the floor.
+  const minBalanceMicroUsd = Number(requireEnv('MIN_BALANCE_MICRO_USD'));
+  const balanceMicroUsd = await getBalance(userId);
+  if (balanceMicroUsd < minBalanceMicroUsd) {
+    return json(402, {
+      error: {
+        code: 'insufficient_balance',
+        message: `prepay balance ${balanceMicroUsd} micro-USD is below the ${minBalanceMicroUsd} micro-USD minimum to start a job`,
+      },
+      balance_micro_usd: balanceMicroUsd,
+      min_balance_micro_usd: minBalanceMicroUsd,
+    });
   }
 
   // Refine jobs chain onto a succeeded preview job owned by the same user.

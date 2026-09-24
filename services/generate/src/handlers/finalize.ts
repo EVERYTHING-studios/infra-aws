@@ -3,6 +3,8 @@ import { getTask, updateTask } from '../lib/tasks-repo.js';
 import { ModelUrls } from '../lib/types.js';
 import { enqueueWebhook } from '../lib/webhook-queue.js';
 import { requireEnv } from '../lib/env.js';
+import { applyLedgerEntry } from '../lib/accounts-repo.js';
+import { billableCharge } from '../lib/billing.js';
 import type { PipelineContext } from './prepare.js';
 
 const cloudfront = new CloudFrontClient({});
@@ -49,6 +51,31 @@ export async function handler(event: PipelineContext): Promise<{ task_id: string
     thumbnail_url: `${baseUrl}/${prefix}-thumbnail.jpg`,
     finished_at: new Date().toISOString(),
   });
+
+  // Usage settlement: API jobs are billed per second of capacity time,
+  // SUCCEEDED only. Failures here must never fail finalize — the task
+  // record retains everything needed to charge manually.
+  if (task.source === 'api') {
+    try {
+      const charge = billableCharge(task);
+      if (!charge) {
+        console.error(
+          `Skipping usage settlement for api task ${task.task_id}: missing timing stamps (manual reconciliation needed)`,
+        );
+      } else {
+        await applyLedgerEntry(task.user_id, -charge.amountMicroUsd, `usage:${task.task_id}`, 'usage', {
+          task_id: task.task_id,
+          instance_type: charge.instanceType,
+          seconds: charge.seconds,
+        });
+        console.log(
+          `Settled api task ${task.task_id}: ${charge.seconds}s on ${charge.instanceType} -> ${charge.amountMicroUsd} micro-USD`,
+        );
+      }
+    } catch (err) {
+      console.error(`Usage settlement failed for api task ${task.task_id} (job stays SUCCEEDED)`, err);
+    }
+  }
 
   await enqueueWebhook(updated);
   return { task_id: task.task_id };

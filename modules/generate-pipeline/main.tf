@@ -175,6 +175,16 @@ data "aws_iam_policy_document" "finalize" {
     resources = [aws_sqs_queue.webhook.arn, aws_sqs_queue.customer_webhook.arn]
   }
 
+  statement {
+    actions = [
+      "dynamodb:GetItem",
+      "dynamodb:PutItem",
+      "dynamodb:UpdateItem",
+      "dynamodb:TransactWriteItems",
+    ]
+    resources = [var.accounts_table_arn]
+  }
+
   dynamic "statement" {
     for_each = var.cloudfront_distribution_id == "" ? [] : [1]
 
@@ -200,6 +210,8 @@ module "finalize" {
     CUSTOMER_WEBHOOK_QUEUE_URL = aws_sqs_queue.customer_webhook.url
     ASSETS_BASE_URL            = var.assets_base_url
     CLOUDFRONT_DISTRIBUTION_ID = var.cloudfront_distribution_id
+    ACCOUNTS_TABLE             = var.accounts_table_name
+    BILLING_RATES_JSON         = var.billing_rates_json
   }
 }
 

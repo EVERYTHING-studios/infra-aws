@@ -131,6 +131,35 @@ module "keys" {
   }
 }
 
+data "aws_iam_policy_document" "balance" {
+  statement {
+    actions = [
+      "dynamodb:GetItem",
+      "dynamodb:PutItem",
+      "dynamodb:Query",
+      "dynamodb:UpdateItem",
+      "dynamodb:TransactWriteItems",
+    ]
+    resources = [local.accounts_table_arn, "${local.accounts_table_arn}/index/*"]
+  }
+}
+
+module "balance" {
+  source = "../lambda-function"
+
+  function_name = "${var.name_prefix}-balance"
+  dist_dir      = "${var.dist_dir}/balance"
+  timeout       = 10
+  policy_json   = data.aws_iam_policy_document.balance.json
+  attach_policy = true
+
+  environment = {
+    ACCOUNTS_TABLE        = aws_dynamodb_table.accounts.name
+    BILLING_RATES_JSON    = var.billing_rates_json
+    MIN_BALANCE_MICRO_USD = var.min_balance_micro_usd
+  }
+}
+
 data "aws_iam_policy_document" "webhook_endpoint" {
   statement {
     actions = [
@@ -187,6 +216,11 @@ data "aws_iam_policy_document" "create_job" {
     actions   = ["s3:PutObject"]
     resources = ["${var.work_bucket_arn}/tasks/*"]
   }
+
+  statement {
+    actions   = ["dynamodb:GetItem"]
+    resources = [local.accounts_table_arn]
+  }
 }
 
 module "create_job" {
@@ -199,11 +233,14 @@ module "create_job" {
   attach_policy = true
 
   environment = {
-    TASKS_TABLE       = var.tasks_table_name
-    STATE_MACHINE_ARN = var.state_machine_arn
-    WORK_BUCKET       = var.work_bucket_name
+    TASKS_TABLE           = var.tasks_table_name
+    STATE_MACHINE_ARN     = var.state_machine_arn
+    WORK_BUCKET           = var.work_bucket_name
+    ACCOUNTS_TABLE        = aws_dynamodb_table.accounts.name
+    MIN_BALANCE_MICRO_USD = var.min_balance_micro_usd
   }
 }
+
 
 data "aws_iam_policy_document" "get_job" {
   statement {
@@ -327,6 +364,10 @@ locals {
       lambda     = module.webhook_endpoint
       authorizer = "customer"
     }
+    "GET /v1/balance" = {
+      lambda     = module.balance
+      authorizer = "customer"
+    }
 
     # Internal surface — shared-key authorizer; the web-app dashboard proxies
     # here. Never exposed to end users.
@@ -360,6 +401,14 @@ locals {
     }
     "POST /v1/accounts/{user_id}/webhook-endpoint/test" = {
       lambda     = module.webhook_endpoint
+      authorizer = "internal"
+    }
+    "GET /v1/accounts/{user_id}/balance" = {
+      lambda     = module.balance
+      authorizer = "internal"
+    }
+    "POST /v1/accounts/{user_id}/balance" = {
+      lambda     = module.balance
       authorizer = "internal"
     }
   }
