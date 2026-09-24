@@ -1,5 +1,5 @@
 import type { APIGatewayProxyEventV2, APIGatewayProxyResultV2 } from 'aws-lambda';
-import { applyLedgerEntry, getBalance, listLedgerByUser, LedgerItem } from '../lib/accounts-repo.js';
+import { applyLedgerEntry, getBalance, listLedgerByUser, upsertAccount, LedgerItem } from '../lib/accounts-repo.js';
 import { billingRates } from '../lib/billing.js';
 import { json, errorResponse, authorizerUserId } from '../lib/http.js';
 import { requireEnv } from '../lib/env.js';
@@ -117,6 +117,10 @@ async function postAdjustment(
   if (body.description !== undefined && (typeof body.description !== 'string' || body.description.length > 200)) {
     return errorResponse(400, 'invalid_request', 'description must be a string of at most 200 characters');
   }
+
+  // The USER# row is only created on first API key / webhook config; create it
+  // here so credits and Stripe top-ups work for users who never touched the API.
+  await upsertAccount(userId);
 
   await applyLedgerEntry(userId, amount, idempotencyKey, 'admin', {
     ...(typeof body.description === 'string' ? { description: body.description } : {}),
