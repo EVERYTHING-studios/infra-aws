@@ -116,3 +116,8 @@ variable "accounts_table_name" {
   description = "Customer API accounts table name — the customer webhook dispatcher reads per-user endpoints/secrets."
   type        = string
 }
+
+variable "billing_rates_json" {
+  description = "JSON map of instance type -> micro-USD per second (2x margin); usage settlement in finalize."
+  type        = string
+}

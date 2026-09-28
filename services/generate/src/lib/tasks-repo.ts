@@ -97,6 +97,8 @@ export interface TaskUpdate {
   finished_at?: string;
   inference_started_at?: string;
   inference_finished_at?: string;
+  capacity_started_at?: string;
+  inference_instance_type?: string;
   remove?: string[];
 }
 

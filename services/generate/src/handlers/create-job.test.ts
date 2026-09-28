@@ -13,6 +13,11 @@ vi.mock('../lib/tasks-repo.js', () => ({
   ttlFromNow: () => 0,
 }));
 
+const getBalance = vi.fn();
+vi.mock('../lib/accounts-repo.js', () => ({
+  getBalance: (...args: unknown[]) => getBalance(...args),
+}));
+
 const offloadDataUri = vi.fn();
 const isDataUri = vi.fn((url: string) => url.startsWith('data:'));
 
@@ -68,6 +73,8 @@ beforeEach(() => {
   isDataUri.mockClear();
   sfnSend.mockReset().mockResolvedValue({ executionArn: 'arn:aws:states:us-east-1:123:execution:sm:name' });
   process.env.STATE_MACHINE_ARN = 'arn:aws:states:us-east-1:123:stateMachine:sm';
+  process.env.MIN_BALANCE_MICRO_USD = '1000000';
+  getBalance.mockReset().mockResolvedValue(1000000);
 });
 
 describe('create-job', () => {
@@ -110,5 +117,37 @@ describe('create-job', () => {
       { requestContext: { http: { method: 'POST', path: '/v1/jobs' } } as APIGatewayProxyEventV2['requestContext'] },
     );
     expect(res.statusCode).toBe(502);
+  });
+
+  it('402s with balance details when the prepay balance is below the minimum', async () => {
+    getBalance.mockResolvedValue(500000);
+
+    const res = await call({ type: 'text-to-3d-preview', input: { prompt: 'a teapot' } });
+
+    expect(res.statusCode).toBe(402);
+    const body = JSON.parse(res.body);
+    expect(body.error.code).toBe('insufficient_balance');
+    expect(body.balance_micro_usd).toBe(500000);
+    expect(body.min_balance_micro_usd).toBe(1000000);
+    expect(getBalance).toHaveBeenCalledWith(USER);
+    expect(putTask).not.toHaveBeenCalled();
+    expect(sfnSend).not.toHaveBeenCalled();
+  });
+
+  it('accepts the job when the balance is exactly at the minimum', async () => {
+    getBalance.mockResolvedValue(1000000);
+    const res = await call({ type: 'text-to-3d-preview', input: { prompt: 'a teapot' } });
+    expect(res.statusCode).toBe(202);
+  });
+
+  it('idempotent replays still return 202 even when the balance has since dropped', async () => {
+    getBalance.mockResolvedValue(0);
+    findByIdempotencyKey.mockResolvedValue({ task_id: '01JEXISTING' });
+
+    const res = await call({ type: 'text-to-3d-preview', input: { prompt: 'a teapot' }, idempotency_key: 'k1' });
+
+    expect(res.statusCode).toBe(202);
+    expect(JSON.parse(res.body)).toEqual({ job_id: '01JEXISTING' });
+    expect(getBalance).not.toHaveBeenCalled();
   });
 });

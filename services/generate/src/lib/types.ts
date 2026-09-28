@@ -109,6 +109,10 @@ export interface TaskRecord {
   /** When inference compute started/finished (SageMaker or stub) — usage-billing data. */
   inference_started_at?: string;
   inference_finished_at?: string;
+  /** When serving capacity was allocated (sentinel promotion) — billing window start. */
+  capacity_started_at?: string;
+  /** Serving instance type token (g5/g6e/g7e) at dispatch — usage-billing rate key. */
+  inference_instance_type?: string;
   created_at: string;
   updated_at: string;
   finished_at?: string;

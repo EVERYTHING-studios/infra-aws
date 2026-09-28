@@ -441,7 +441,7 @@ describe('queued-task rescue + promotion', () => {
       expect.objectContaining({
         Key: { pk: 'TASK#01JQUEUED01' },
         UpdateExpression:
-          'SET #status = :in_progress, gsi2pk = :gsi2, updated_at = :now, gsi4pk = :gsi4',
+          'SET #status = :in_progress, gsi2pk = :gsi2, updated_at = :now, capacity_started_at = :capacity, gsi4pk = :gsi4',
         ExpressionAttributeNames: { '#status': 'status' },
         ConditionExpression: '#status = :queued',
         ExpressionAttributeValues: expect.objectContaining({
@@ -496,5 +496,72 @@ describe('queued-task rescue + promotion', () => {
 
     expect(result.promoted).toBe(0);
     expect(h.webhooks).toEqual([]);
+  });
+
+  it('stamps capacity_started_at at the scale-out start when the boot happened after dispatch (cold instance)', async () => {
+    const scaleUpStart = new Date(h.now - 3 * 60 * 1000); // cold boot after the task was dispatched
+    h.factsByEndpoint['svc-sagemaker-g5'] = {
+      status: 'InService', current: 1, desired: 1,
+      activityCode: 'Successful', activityDescription: 'Setting desired instance count to 1.',
+      activityStartMinAgo: 3,
+    };
+    for (const name of [
+      'svc-sagemaker-g5-useast2', 'svc-sagemaker-g6e', 'svc-sagemaker-g6e-useast2',
+      'svc-sagemaker-g7e', 'svc-sagemaker-g7e-useast2',
+    ]) {
+      h.factsByEndpoint[name] = { status: 'Failed', current: 0, desired: 0 };
+    }
+    h.ssmValues[ACTIVE_PARAM] = 'svc-sagemaker-g5';
+    h.tasks = [mkTask({ sagemaker_region: 'us-east-1', inference_started_at: ago(10).toISOString() })];
+
+    await handler();
+
+    const values = (h.updates[0] as UpdateLike & { ExpressionAttributeValues?: Record<string, string> })
+      .ExpressionAttributeValues ?? {};
+    expect(Date.parse(values[':capacity'] as string)).toBeCloseTo(scaleUpStart.getTime(), -3);
+  });
+
+  it('stamps capacity_started_at at dispatch when the scale-out predates dispatch (warm instance)', async () => {
+    const dispatch = ago(4);
+    h.factsByEndpoint['svc-sagemaker-g5'] = {
+      status: 'InService', current: 1, desired: 1,
+      activityCode: 'Successful', activityDescription: 'Setting desired instance count to 1.',
+      activityStartMinAgo: 30,
+    };
+    for (const name of [
+      'svc-sagemaker-g5-useast2', 'svc-sagemaker-g6e', 'svc-sagemaker-g6e-useast2',
+      'svc-sagemaker-g7e', 'svc-sagemaker-g7e-useast2',
+    ]) {
+      h.factsByEndpoint[name] = { status: 'Failed', current: 0, desired: 0 };
+    }
+    h.ssmValues[ACTIVE_PARAM] = 'svc-sagemaker-g5';
+    h.tasks = [mkTask({ sagemaker_region: 'us-east-1', inference_started_at: dispatch.toISOString() })];
+
+    await handler();
+
+    const values = (h.updates[0] as UpdateLike & { ExpressionAttributeValues?: Record<string, string> })
+      .ExpressionAttributeValues ?? {};
+    expect(Date.parse(values[':capacity'] as string)).toBe(dispatch.getTime());
+  });
+
+  it('falls back to poll time when no successful scale-out activity exists', async () => {
+    const before = Date.now();
+    h.factsByEndpoint['svc-sagemaker-g5'] = { status: 'InService', current: 1, desired: 1 };
+    for (const name of [
+      'svc-sagemaker-g5-useast2', 'svc-sagemaker-g6e', 'svc-sagemaker-g6e-useast2',
+      'svc-sagemaker-g7e', 'svc-sagemaker-g7e-useast2',
+    ]) {
+      h.factsByEndpoint[name] = { status: 'Failed', current: 0, desired: 0 };
+    }
+    h.ssmValues[ACTIVE_PARAM] = 'svc-sagemaker-g5';
+    h.tasks = [mkTask({ sagemaker_region: 'us-east-1', inference_started_at: ago(10).toISOString() })];
+
+    await handler();
+
+    const values = (h.updates[0] as UpdateLike & { ExpressionAttributeValues?: Record<string, string> })
+      .ExpressionAttributeValues ?? {};
+    const stamped = Date.parse(values[':capacity'] as string);
+    expect(stamped).toBeGreaterThanOrEqual(before);
+    expect(stamped).toBeLessThanOrEqual(Date.now());
   });
 });
