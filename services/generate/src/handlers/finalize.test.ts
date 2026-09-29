@@ -51,7 +51,7 @@ beforeEach(() => {
   applyLedgerEntry.mockReset().mockResolvedValue({});
   enqueueWebhook.mockReset().mockResolvedValue(undefined);
   process.env.ASSETS_BASE_URL = 'https://assets.example';
-  process.env.BILLING_RATES_JSON = '{"g5":844,"g6e":1556,"g7e":2333}';
+  process.env.BILLING_RATES_JSON = '{"g5":0.000844,"g6e":0.001556,"g7e":0.002333}';
   delete process.env.CLOUDFRONT_DISTRIBUTION_ID;
 });
 
@@ -74,7 +74,7 @@ describe('finalize usage settlement', () => {
     expect(applyLedgerEntry).toHaveBeenCalledTimes(1);
     expect(applyLedgerEntry).toHaveBeenCalledWith(
       task.user_id,
-      -60 * 844,
+      -0.05064,
       'usage:01JFINAL01',
       'usage',
       { task_id: '01JFINAL01', instance_type: 'g5', seconds: 60 },
