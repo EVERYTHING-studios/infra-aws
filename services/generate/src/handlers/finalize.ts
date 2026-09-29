@@ -63,13 +63,13 @@ export async function handler(event: PipelineContext): Promise<{ task_id: string
           `Skipping usage settlement for api task ${task.task_id}: missing timing stamps (manual reconciliation needed)`,
         );
       } else {
-        await applyLedgerEntry(task.user_id, -charge.amountMicroUsd, `usage:${task.task_id}`, 'usage', {
+        await applyLedgerEntry(task.user_id, -charge.amountUsd, `usage:${task.task_id}`, 'usage', {
           task_id: task.task_id,
           instance_type: charge.instanceType,
           seconds: charge.seconds,
         });
         console.log(
-          `Settled api task ${task.task_id}: ${charge.seconds}s on ${charge.instanceType} -> ${charge.amountMicroUsd} micro-USD`,
+          `Settled api task ${task.task_id}: ${charge.seconds}s on ${charge.instanceType} -> ${charge.amountUsd} USD`,
         );
       }
     } catch (err) {

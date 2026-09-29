@@ -73,8 +73,8 @@ beforeEach(() => {
   isDataUri.mockClear();
   sfnSend.mockReset().mockResolvedValue({ executionArn: 'arn:aws:states:us-east-1:123:execution:sm:name' });
   process.env.STATE_MACHINE_ARN = 'arn:aws:states:us-east-1:123:stateMachine:sm';
-  process.env.MIN_BALANCE_MICRO_USD = '1000000';
-  getBalance.mockReset().mockResolvedValue(1000000);
+  process.env.MIN_BALANCE_USD = '1';
+  getBalance.mockReset().mockResolvedValue(1);
 });
 
 describe('create-job', () => {
@@ -120,22 +120,22 @@ describe('create-job', () => {
   });
 
   it('402s with balance details when the prepay balance is below the minimum', async () => {
-    getBalance.mockResolvedValue(500000);
+    getBalance.mockResolvedValue(0.5);
 
     const res = await call({ type: 'text-to-3d-preview', input: { prompt: 'a teapot' } });
 
     expect(res.statusCode).toBe(402);
     const body = JSON.parse(res.body);
     expect(body.error.code).toBe('insufficient_balance');
-    expect(body.balance_micro_usd).toBe(500000);
-    expect(body.min_balance_micro_usd).toBe(1000000);
+    expect(body.balance_usd).toBe(0.5);
+    expect(body.min_balance_usd).toBe(1);
     expect(getBalance).toHaveBeenCalledWith(USER);
     expect(putTask).not.toHaveBeenCalled();
     expect(sfnSend).not.toHaveBeenCalled();
   });
 
   it('accepts the job when the balance is exactly at the minimum', async () => {
-    getBalance.mockResolvedValue(1000000);
+    getBalance.mockResolvedValue(1);
     const res = await call({ type: 'text-to-3d-preview', input: { prompt: 'a teapot' } });
     expect(res.statusCode).toBe(202);
   });

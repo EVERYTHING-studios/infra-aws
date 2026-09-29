@@ -3,7 +3,7 @@ import type { TaskRecord } from './types.js';
 /**
  * Usage billing: per-second charges for API jobs over the capacity window
  * (capacity_started_at -> inference_finished_at), at 2x-margin per-instance
- * rates configured via BILLING_RATES_JSON (micro-USD per second, integers).
+ * rates configured via BILLING_RATES_JSON (USD per second).
  * SUCCEEDED-only settlement happens in finalize; this lib is pure math.
  */
 
@@ -32,7 +32,7 @@ export function rateFor(instanceType: string | undefined, ratesJson = process.en
   return cachedRates[DEFAULT_RATE_FALLBACK_INSTANCE] ?? 0;
 }
 
-/** Parsed BILLING_RATES_JSON map (instance type -> micro-USD/second), for display surfaces. */
+/** Parsed BILLING_RATES_JSON map (instance type -> USD/second), for display surfaces. */
 export function billingRates(ratesJson = process.env.BILLING_RATES_JSON): Record<string, number> {
   rateFor(undefined, ratesJson); // prime the cache
   return { ...cachedRates };
@@ -40,7 +40,7 @@ export function billingRates(ratesJson = process.env.BILLING_RATES_JSON): Record
 
 export interface BillableCharge {
   seconds: number;
-  amountMicroUsd: number;
+  amountUsd: number;
   instanceType: string | undefined;
 }
 
@@ -60,5 +60,8 @@ export function billableCharge(task: TaskRecord): BillableCharge | null {
   if (!Number.isFinite(startMs) || !Number.isFinite(finishMs)) return null;
   const seconds = Math.max(0, Math.ceil((finishMs - startMs) / 1000));
   const rate = rateFor(task.inference_instance_type);
-  return { seconds, amountMicroUsd: seconds * rate, instanceType: task.inference_instance_type };
+  // Repair-only rounding: rates are <=6dp decimals and seconds an integer, so
+  // the exact product is a multiple of 1e-6; Math.round on the magnitude
+  // scaled by 1e6 strips float noise without changing the exact value.
+  return { seconds, amountUsd: Math.round(seconds * rate * 1_000_000) / 1_000_000, instanceType: task.inference_instance_type };
 }

@@ -154,9 +154,9 @@ module "balance" {
   attach_policy = true
 
   environment = {
-    ACCOUNTS_TABLE        = aws_dynamodb_table.accounts.name
-    BILLING_RATES_JSON    = var.billing_rates_json
-    MIN_BALANCE_MICRO_USD = var.min_balance_micro_usd
+    ACCOUNTS_TABLE     = aws_dynamodb_table.accounts.name
+    BILLING_RATES_JSON = var.billing_rates_json
+    MIN_BALANCE_USD    = var.min_balance_usd
   }
 }
 
@@ -233,11 +233,11 @@ module "create_job" {
   attach_policy = true
 
   environment = {
-    TASKS_TABLE           = var.tasks_table_name
-    STATE_MACHINE_ARN     = var.state_machine_arn
-    WORK_BUCKET           = var.work_bucket_name
-    ACCOUNTS_TABLE        = aws_dynamodb_table.accounts.name
-    MIN_BALANCE_MICRO_USD = var.min_balance_micro_usd
+    TASKS_TABLE       = var.tasks_table_name
+    STATE_MACHINE_ARN = var.state_machine_arn
+    WORK_BUCKET       = var.work_bucket_name
+    ACCOUNTS_TABLE    = aws_dynamodb_table.accounts.name
+    MIN_BALANCE_USD   = var.min_balance_usd
   }
 }
 

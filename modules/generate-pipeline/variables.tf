@@ -118,6 +118,6 @@ variable "accounts_table_name" {
 }
 
 variable "billing_rates_json" {
-  description = "JSON map of instance type -> micro-USD per second (2x margin); usage settlement in finalize."
+  description = "JSON map of instance type -> USD per second (2x margin); usage settlement in finalize."
   type        = string
 }

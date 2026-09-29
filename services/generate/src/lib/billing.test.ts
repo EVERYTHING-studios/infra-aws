@@ -31,22 +31,22 @@ function mkTask(overrides: Partial<TaskRecord> = {}): TaskRecord {
   };
 }
 
-const RATES = '{"g5":844,"g6e":1556,"g7e":2333}';
+const RATES = '{"g5":0.000844,"g6e":0.001556,"g7e":0.002333}';
 
 describe('rateFor', () => {
   it('returns the configured rate per instance type', async () => {
     const { rateFor } = await freshBilling(RATES);
-    expect(rateFor('g5')).toBe(844);
-    expect(rateFor('g6e')).toBe(1556);
-    expect(rateFor('g7e')).toBe(2333);
+    expect(rateFor('g5')).toBe(0.000844);
+    expect(rateFor('g6e')).toBe(0.001556);
+    expect(rateFor('g7e')).toBe(0.002333);
   });
 
   it('falls back to the g5 rate (with a warning) for unknown or missing types', async () => {
     const { rateFor } = await freshBilling(RATES);
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     try {
-      expect(rateFor('g8e')).toBe(844);
-      expect(rateFor(undefined)).toBe(844);
+      expect(rateFor('g8e')).toBe(0.000844);
+      expect(rateFor(undefined)).toBe(0.000844);
       expect(warn).toHaveBeenCalledTimes(2);
     } finally {
       warn.mockRestore();
@@ -54,9 +54,9 @@ describe('rateFor', () => {
   });
 
   it('parses only the numeric entries and ignores garbage JSON gracefully', async () => {
-    const { rateFor, billingRates } = await freshBilling('{"g5":844,"g6e":"many","g7e":2333}');
-    expect(billingRates()).toEqual({ g5: 844, g7e: 2333 });
-    expect(rateFor('g6e')).toBe(844); // dropped entry -> g5 fallback
+    const { rateFor, billingRates } = await freshBilling('{"g5":0.000844,"g6e":"many","g7e":0.002333}');
+    expect(billingRates()).toEqual({ g5: 0.000844, g7e: 0.002333 });
+    expect(rateFor('g6e')).toBe(0.000844); // dropped entry -> g5 fallback
   });
 });
 
@@ -70,7 +70,7 @@ describe('billableCharge', () => {
         inference_instance_type: 'g6e',
       }),
     );
-    expect(charge).toEqual({ seconds: 151, amountMicroUsd: 151 * 1556, instanceType: 'g6e' });
+    expect(charge).toEqual({ seconds: 151, amountUsd: 0.234956, instanceType: 'g6e' });
   });
 
   it('clamps to zero when the capacity stamp lands after the finish stamp (callback race)', async () => {
@@ -81,7 +81,7 @@ describe('billableCharge', () => {
         inference_finished_at: '2026-09-20T12:05:00.000Z',
       }),
     );
-    expect(charge).toEqual({ seconds: 0, amountMicroUsd: 0, instanceType: undefined });
+    expect(charge).toEqual({ seconds: 0, amountUsd: 0, instanceType: undefined });
   });
 
   it('falls back to inference_started_at when the capacity stamp is absent (stub backend)', async () => {
@@ -93,7 +93,7 @@ describe('billableCharge', () => {
         inference_instance_type: 'g5',
       }),
     );
-    expect(charge).toEqual({ seconds: 30, amountMicroUsd: 30 * 844, instanceType: 'g5' });
+    expect(charge).toEqual({ seconds: 30, amountUsd: 0.02532, instanceType: 'g5' });
   });
 
   it('returns null when the finish stamp is missing, and when both stamps are missing', async () => {

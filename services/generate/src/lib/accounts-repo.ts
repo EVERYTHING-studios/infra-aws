@@ -18,11 +18,11 @@ import { requireEnv } from './env.js';
  *
  * Item layout (pk-partitioned, single table):
  *   pk = USER#{user_id}:  { user_id, display_name?, webhook_url?, webhook_secret?,
- *                          balance_micro_usd?, created_at, updated_at }
+ *                          balance_usd?, created_at, updated_at }
  *   pk = KEY#{key_id}:    { key_id, user_id, key_hash, label, status, created_at,
  *                          last_used_at? }
  *                          + gsi1pk = USER#{user_id}#KEYS, gsi1sk = created_at
- *   pk = LEDGER#{idem}:   { idem, user_id, kind, amount_micro_usd, task_id?,
+ *   pk = LEDGER#{idem}:   { idem, user_id, kind, amount_usd, task_id?,
  *                          instance_type?, seconds?, description?, created_at }
  *                          + gsi1pk = USER#{user_id}#LEDGER, gsi1sk = created_at
  *                          (financial record — no TTL, ever)
@@ -33,8 +33,8 @@ export interface AccountItem {
   display_name?: string;
   webhook_url?: string;
   webhook_secret?: string;
-  /** Prepay balance in micro-USD (1e-6 USD); absent = 0. */
-  balance_micro_usd?: number;
+  /** Prepay balance in USD; absent = 0. */
+  balance_usd?: number;
   created_at: string;
   updated_at: string;
 }
@@ -46,8 +46,8 @@ export interface LedgerItem {
   idem: string;
   user_id: string;
   kind: LedgerKind;
-  /** Signed micro-USD; usage entries are negative. */
-  amount_micro_usd: number;
+  /** Signed USD; usage entries are negative. */
+  amount_usd: number;
   task_id?: string;
   instance_type?: string;
   seconds?: number;
@@ -117,10 +117,10 @@ export async function getAccount(userId: string): Promise<AccountItem | null> {
   return (result.Item as AccountItem | undefined) ?? null;
 }
 
-/** Prepay balance in micro-USD; absent account row or attribute reads as 0. */
+/** Prepay balance in USD; absent account row or attribute reads as 0. */
 export async function getBalance(userId: string): Promise<number> {
   const account = await getAccount(userId);
-  return account?.balance_micro_usd ?? 0;
+  return account?.balance_usd ?? 0;
 }
 
 export interface LedgerEntryMeta {
@@ -142,7 +142,7 @@ export interface LedgerEntryMeta {
  */
 export async function applyLedgerEntry(
   userId: string,
-  amountMicroUsd: number,
+  amountUsd: number,
   idem: string,
   kind: LedgerKind,
   meta: LedgerEntryMeta = {},
@@ -160,7 +160,7 @@ export async function applyLedgerEntry(
                 idem,
                 user_id: userId,
                 kind,
-                amount_micro_usd: amountMicroUsd,
+                amount_usd: amountUsd,
                 task_id: meta.task_id,
                 instance_type: meta.instance_type,
                 seconds: meta.seconds,
@@ -177,10 +177,10 @@ export async function applyLedgerEntry(
               TableName: requireEnv('ACCOUNTS_TABLE'),
               Key: userPk(userId),
               UpdateExpression:
-                'SET balance_micro_usd = if_not_exists(balance_micro_usd, :zero) + :delta, updated_at = :now',
+                'SET balance_usd = if_not_exists(balance_usd, :zero) + :delta, updated_at = :now',
               ExpressionAttributeValues: {
                 ':zero': 0,
-                ':delta': amountMicroUsd,
+                ':delta': amountUsd,
                 ':now': now,
               },
               ConditionExpression: 'attribute_exists(pk)',

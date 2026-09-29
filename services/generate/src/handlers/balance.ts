@@ -27,8 +27,8 @@ export async function handler(event: APIGatewayProxyEventV2): Promise<APIGateway
       return errorResponse(502, 'internal_error', 'authorizer context missing user_id');
     }
     return json(200, {
-      balance_micro_usd: await getBalance(userId),
-      min_balance_micro_usd: Number(requireEnv('MIN_BALANCE_MICRO_USD')),
+      balance_usd: await getBalance(userId),
+      min_balance_usd: Number(requireEnv('MIN_BALANCE_USD')),
       rates: billingRates(),
     });
   }
@@ -70,8 +70,8 @@ async function getBalancePage(
 
   const [balance, page] = await Promise.all([getBalance(userId), listLedgerByUser(userId, limit, cursor)]);
   return json(200, {
-    balance_micro_usd: balance,
-    min_balance_micro_usd: Number(requireEnv('MIN_BALANCE_MICRO_USD')),
+    balance_usd: balance,
+    min_balance_usd: Number(requireEnv('MIN_BALANCE_USD')),
     rates: billingRates(),
     entries: page.items.map(toLedgerEntry),
     ...(page.lastEvaluatedKey ? { next_cursor: page.lastEvaluatedKey } : {}),
@@ -82,7 +82,7 @@ function toLedgerEntry(item: LedgerItem) {
   return {
     idem: item.idem,
     kind: item.kind,
-    amount_micro_usd: item.amount_micro_usd,
+    amount_usd: item.amount_usd,
     ...(item.task_id !== undefined ? { task_id: item.task_id } : {}),
     ...(item.instance_type !== undefined ? { instance_type: item.instance_type } : {}),
     ...(item.seconds !== undefined ? { seconds: item.seconds } : {}),
@@ -96,7 +96,7 @@ async function postAdjustment(
   rawBody: string | null | undefined,
 ): Promise<APIGatewayProxyResultV2> {
   let body: {
-    amount_micro_usd?: unknown;
+    amount_usd?: unknown;
     idempotency_key?: unknown;
     description?: unknown;
   };
@@ -106,9 +106,9 @@ async function postAdjustment(
     return errorResponse(400, 'invalid_request', 'request body is not valid JSON');
   }
 
-  const amount = body.amount_micro_usd;
-  if (typeof amount !== 'number' || !Number.isInteger(amount) || amount === 0) {
-    return errorResponse(400, 'invalid_request', 'amount_micro_usd must be a non-zero integer (micro-USD)');
+  const amount = body.amount_usd;
+  if (typeof amount !== 'number' || !Number.isFinite(amount) || amount === 0 || Math.abs(amount * 1e6 - Math.round(amount * 1e6)) > 1e-6) {
+    return errorResponse(400, 'invalid_request', 'amount_usd must be a non-zero number with at most 6 decimal places (USD)');
   }
   const idempotencyKey = body.idempotency_key;
   if (typeof idempotencyKey !== 'string' || idempotencyKey.length < 1 || idempotencyKey.length > 200) {
@@ -125,5 +125,5 @@ async function postAdjustment(
   await applyLedgerEntry(userId, amount, idempotencyKey, 'admin', {
     ...(typeof body.description === 'string' ? { description: body.description } : {}),
   });
-  return json(200, { balance_micro_usd: await getBalance(userId) });
+  return json(200, { balance_usd: await getBalance(userId) });
 }

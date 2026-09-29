@@ -73,8 +73,8 @@ locals {
   certificate_arn = "arn:aws:acm:us-east-1:095256591532:certificate/ba84a0d5-7004-487f-a7fb-f89f20117f21"
 
   # API usage billing (single source for pipeline + customer_api — no drift).
-  billing_rates_json    = jsonencode({ g5 = 844, g6e = 1556, g7e = 2333 })
-  min_balance_micro_usd = 1000000
+  billing_rates_json = jsonencode({ g5 = 0.000844, g6e = 0.001556, g7e = 0.002333 })
+  min_balance_usd    = 1.00
 }
 
 # ------------------------------------------------------------------
@@ -235,5 +235,5 @@ module "customer_api" {
   customer_webhook_queue_url = module.pipeline.customer_webhook_queue_url
   customer_webhook_queue_arn = module.pipeline.customer_webhook_queue_arn
   billing_rates_json         = local.billing_rates_json
-  min_balance_micro_usd      = local.min_balance_micro_usd
+  min_balance_usd            = local.min_balance_usd
 }

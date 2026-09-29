@@ -87,8 +87,8 @@ beforeEach(() => {
 
 describe('getBalance', () => {
   it('reads the account row and returns its balance', async () => {
-    h.getItem = { user_id: USER, balance_micro_usd: 2500000 };
-    await expect(getBalance(USER)).resolves.toBe(2500000);
+    h.getItem = { user_id: USER, balance_usd: 2.5 };
+    await expect(getBalance(USER)).resolves.toBe(2.5);
     expect(h.gets[0]).toMatchObject({ Key: { pk: `USER#${USER}` } });
   });
 
@@ -101,7 +101,7 @@ describe('getBalance', () => {
 
 describe('applyLedgerEntry', () => {
   it('writes ledger item and balance delta in one transaction', async () => {
-    await applyLedgerEntry(USER, -1000, 'usage:01JT1', 'usage', {
+    await applyLedgerEntry(USER, -0.001, 'usage:01JT1', 'usage', {
       task_id: '01JT1',
       instance_type: 'g5',
       seconds: 2,
@@ -116,7 +116,7 @@ describe('applyLedgerEntry', () => {
         idem: 'usage:01JT1',
         user_id: USER,
         kind: 'usage',
-        amount_micro_usd: -1000,
+        amount_usd: -0.001,
         task_id: '01JT1',
         instance_type: 'g5',
         seconds: 2,
@@ -127,14 +127,14 @@ describe('applyLedgerEntry', () => {
     expect(update!.Update).toMatchObject({
       Key: { pk: `USER#${USER}` },
       UpdateExpression:
-        'SET balance_micro_usd = if_not_exists(balance_micro_usd, :zero) + :delta, updated_at = :now',
+        'SET balance_usd = if_not_exists(balance_usd, :zero) + :delta, updated_at = :now',
       ConditionExpression: 'attribute_exists(pk)',
     });
   });
 
   it('reports already_applied on idempotent replay instead of double-charging', async () => {
     h.cancelReasons = [{ Code: 'ConditionalCheckFailed' }, { Code: 'None' }];
-    const result = await applyLedgerEntry(USER, 10000000, 'topup:cs_test_1', 'topup');
+    const result = await applyLedgerEntry(USER, 10, 'topup:cs_test_1', 'topup');
     expect(result).toEqual({ already_applied: true });
     // The retried transaction was attempted exactly once — no second attempt.
     expect(h.transactions).toHaveLength(1);
@@ -142,7 +142,7 @@ describe('applyLedgerEntry', () => {
 
   it('throws when the account row is missing (update condition failed)', async () => {
     h.cancelReasons = [{ Code: 'None' }, { Code: 'ConditionalCheckFailed' }];
-    await expect(applyLedgerEntry(USER, -500, 'usage:01JT2', 'usage')).rejects.toThrow(
+    await expect(applyLedgerEntry(USER, -0.0005, 'usage:01JT2', 'usage')).rejects.toThrow(
       `account ${USER} not found`,
     );
   });

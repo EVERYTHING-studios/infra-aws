@@ -57,16 +57,16 @@ export async function handler(event: APIGatewayProxyEventV2): Promise<APIGateway
   // an already-created job still return 202 regardless of current balance.
   // Settlement may still drive the balance negative (overdraft accepted);
   // this gate only blocks starting new jobs below the floor.
-  const minBalanceMicroUsd = Number(requireEnv('MIN_BALANCE_MICRO_USD'));
-  const balanceMicroUsd = await getBalance(userId);
-  if (balanceMicroUsd < minBalanceMicroUsd) {
+  const minBalanceUsd = Number(requireEnv('MIN_BALANCE_USD'));
+  const balanceUsd = await getBalance(userId);
+  if (balanceUsd < minBalanceUsd) {
     return json(402, {
       error: {
         code: 'insufficient_balance',
-        message: `prepay balance ${balanceMicroUsd} micro-USD is below the ${minBalanceMicroUsd} micro-USD minimum to start a job`,
+        message: `prepay balance $${balanceUsd.toFixed(2)} is below the $${minBalanceUsd.toFixed(2)} minimum to start a job`,
       },
-      balance_micro_usd: balanceMicroUsd,
-      min_balance_micro_usd: minBalanceMicroUsd,
+      balance_usd: balanceUsd,
+      min_balance_usd: minBalanceUsd,
     });
   }
 

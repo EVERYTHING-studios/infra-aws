@@ -33,7 +33,7 @@ function post(body: unknown): Promise<JsonResult> {
 }
 
 beforeEach(() => {
-  getBalance.mockReset().mockResolvedValue(1_000_000);
+  getBalance.mockReset().mockResolvedValue(1);
   listLedgerByUser.mockReset();
   upsertAccount.mockReset().mockResolvedValue(undefined);
   applyLedgerEntry.mockReset().mockResolvedValue({});
@@ -41,17 +41,17 @@ beforeEach(() => {
 
 describe('POST /v1/accounts/{user_id}/balance', () => {
   it('creates the account row before applying the ledger entry', async () => {
-    const result = await post({ amount_micro_usd: 1_000_000, idempotency_key: 'admin:x' });
+    const result = await post({ amount_usd: 1, idempotency_key: 'admin:x' });
 
     expect(result.statusCode).toBe(200);
-    expect(JSON.parse(result.body)).toEqual({ balance_micro_usd: 1_000_000 });
+    expect(JSON.parse(result.body)).toEqual({ balance_usd: 1 });
 
     expect(upsertAccount).toHaveBeenCalledTimes(1);
     expect(upsertAccount).toHaveBeenCalledWith(USER_ID);
     expect(applyLedgerEntry).toHaveBeenCalledTimes(1);
     expect(applyLedgerEntry).toHaveBeenCalledWith(
       USER_ID,
-      1_000_000,
+      1,
       'admin:x',
       'admin',
       {},
@@ -62,7 +62,7 @@ describe('POST /v1/accounts/{user_id}/balance', () => {
   });
 
   it('rejects a zero amount without touching the repo', async () => {
-    const result = await post({ amount_micro_usd: 0, idempotency_key: 'k' });
+    const result = await post({ amount_usd: 0, idempotency_key: 'k' });
 
     expect(result.statusCode).toBe(400);
     expect(upsertAccount).not.toHaveBeenCalled();
@@ -70,7 +70,15 @@ describe('POST /v1/accounts/{user_id}/balance', () => {
   });
 
   it('rejects a missing idempotency_key', async () => {
-    const result = await post({ amount_micro_usd: 1 });
+    const result = await post({ amount_usd: 1 });
+
+    expect(result.statusCode).toBe(400);
+    expect(upsertAccount).not.toHaveBeenCalled();
+    expect(applyLedgerEntry).not.toHaveBeenCalled();
+  });
+
+  it('rejects an amount with more than 6 decimal places', async () => {
+    const result = await post({ amount_usd: 0.0000001, idempotency_key: 'k' });
 
     expect(result.statusCode).toBe(400);
     expect(upsertAccount).not.toHaveBeenCalled();
