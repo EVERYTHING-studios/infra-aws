@@ -102,6 +102,27 @@ module "get_task" {
   }
 }
 
+data "aws_iam_policy_document" "admin_stats" {
+  statement {
+    actions   = ["dynamodb:Scan"]
+    resources = [var.tasks_table_arn]
+  }
+}
+
+module "admin_stats" {
+  source = "../lambda-function"
+
+  function_name = "${var.name_prefix}-admin-stats"
+  dist_dir      = "${var.dist_dir}/admin-stats"
+  timeout       = 30
+  policy_json   = data.aws_iam_policy_document.admin_stats.json
+  attach_policy = true
+
+  environment = {
+    TASKS_TABLE = var.tasks_table_name
+  }
+}
+
 data "aws_iam_policy_document" "cancel_task" {
   statement {
     actions   = ["dynamodb:GetItem", "dynamodb:UpdateItem"]
@@ -184,6 +205,10 @@ locals {
     "GET /v1/generate/health" = {
       lambda     = module.health
       authorized = false
+    }
+    "GET /v1/generate/admin/stats" = {
+      lambda     = module.admin_stats
+      authorized = true
     }
   }
 }
