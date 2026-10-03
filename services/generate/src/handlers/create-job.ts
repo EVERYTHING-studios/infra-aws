@@ -14,6 +14,7 @@ import { TaskRecord } from '../lib/types.js';
 import { json, errorResponse, authorizerUserId } from '../lib/http.js';
 import { requireEnv } from '../lib/env.js';
 import { isDataUri, offloadDataUri } from '../lib/data-uris.js';
+import { TEST_API_KEY_USER_ID } from '../lib/api-keys.js';
 
 const sfn = new SFNClient({});
 
@@ -51,6 +52,45 @@ export async function handler(event: APIGatewayProxyEventV2): Promise<APIGateway
     if (existing) {
       return json(202, { job_id: existing.task_id });
     }
+  }
+
+  // Test mode: the documented public test key. Skip billing, parent-refine
+  // checks, and the pipeline entirely — persist a task that is already
+  // SUCCEEDED with the fixed test asset. No billing timing stamps are set,
+  // so even a hypothetical finalize pass would compute a $0 charge.
+  if (userId === TEST_API_KEY_USER_ID) {
+    const testAssetUrl = requireEnv('TEST_ASSET_URL');
+    // Same data-URI offload as the normal path: the record must hold s3://
+    // refs, never megabytes of base64 (DynamoDB 400 KB item cap).
+    const taskId = ulid();
+    const imageUrls = request.input.image_urls;
+    if (imageUrls) {
+      request.input.image_urls = await Promise.all(
+        imageUrls.map((url, index) =>
+          isDataUri(url) ? offloadDataUri(url, `tasks/${taskId}/uploads/${index}`) : url,
+        ),
+      );
+    }
+    const now = new Date();
+    const testRecord: TaskRecord = {
+      task_id: taskId,
+      type: request.type,
+      status: 'SUCCEEDED',
+      progress: 100,
+      input: request.input,
+      options: request.options ?? {},
+      user_id: userId,
+      job_id: ulid(),
+      idempotency_key: request.idempotency_key,
+      source: 'api',
+      model_urls: { glb: testAssetUrl },
+      created_at: now.toISOString(),
+      updated_at: now.toISOString(),
+      finished_at: now.toISOString(),
+      ttl: ttlFromNow(now),
+    };
+    await putTask(testRecord);
+    return json(202, { job_id: testRecord.task_id });
   }
 
   // Minimum prepay balance gate. After the idempotency check so replays of

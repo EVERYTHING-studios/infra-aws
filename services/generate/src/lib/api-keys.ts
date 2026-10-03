@@ -60,3 +60,12 @@ export function parseApiKey(token: string): { key_id: string; secret: string } |
   const match = TOKEN_RE.exec(token);
   return match ? { key_id: match[1]!, secret: match[2]! } : null;
 }
+
+/**
+ * Public, documented test key: a fixed literal (not a secret) that lets API
+ * customers exercise the job flow at zero cost. Recognized by the customer
+ * authorizer before per-user key lookup; jobs created with it are
+ * short-circuited in create-job (no billing, no pipeline execution).
+ */
+export const TEST_API_KEY_TOKEN = 'esk_testmode';
+export const TEST_API_KEY_USER_ID = 'testmode';

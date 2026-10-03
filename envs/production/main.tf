@@ -236,4 +236,5 @@ module "customer_api" {
   customer_webhook_queue_arn = module.pipeline.customer_webhook_queue_arn
   billing_rates_json         = local.billing_rates_json
   min_balance_usd            = local.min_balance_usd
+  test_asset_url             = "https://everythingstudios.ai/api/embed/6bd52e34-3268-460d-a14f-0f44713efb87/model"
 }

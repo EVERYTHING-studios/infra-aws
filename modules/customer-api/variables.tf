@@ -62,3 +62,8 @@ variable "min_balance_usd" {
   description = "Minimum prepay balance (USD) required to start a job."
   type        = number
 }
+
+variable "test_asset_url" {
+  description = "Fixed GLB URL returned by test-mode jobs (public test key)."
+  type        = string
+}

@@ -1,6 +1,6 @@
 import type { APIGatewayRequestAuthorizerEventV2 } from 'aws-lambda';
 import { getApiKey, touchLastUsed } from '../lib/accounts-repo.js';
-import { parseApiKey, sha256Hex, constantTimeEquals } from '../lib/api-keys.js';
+import { parseApiKey, sha256Hex, constantTimeEquals, TEST_API_KEY_TOKEN, TEST_API_KEY_USER_ID } from '../lib/api-keys.js';
 
 /**
  * Wire format for HTTP API request authorizers with simple responses:
@@ -30,6 +30,14 @@ export async function handler(
   const token = event.headers?.['x-api-key'] ?? bearer;
   if (!token) {
     return { isAuthorized: false };
+  }
+  // Public test key: fixed literal, documented in the developer dashboard.
+  // Grants the synthetic 'testmode' user; create-job short-circuits its jobs.
+  if (token === TEST_API_KEY_TOKEN) {
+    return {
+      isAuthorized: true,
+      context: { user_id: TEST_API_KEY_USER_ID, key_id: 'testmode' },
+    };
   }
 
   const parsed = parseApiKey(token);

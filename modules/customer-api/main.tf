@@ -238,6 +238,7 @@ module "create_job" {
     WORK_BUCKET       = var.work_bucket_name
     ACCOUNTS_TABLE    = aws_dynamodb_table.accounts.name
     MIN_BALANCE_USD   = var.min_balance_usd
+    TEST_ASSET_URL    = var.test_asset_url
   }
 }
 

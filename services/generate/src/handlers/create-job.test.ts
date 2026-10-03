@@ -60,6 +60,13 @@ async function call(body: unknown, overrides: Partial<APIGatewayProxyEventV2> = 
   return (await handler(event)) as JsonResult;
 }
 
+const TEST_MODE = {
+  requestContext: {
+    http: { method: 'POST', path: '/v1/jobs' },
+    authorizer: { lambda: { user_id: 'testmode' } },
+  },
+} as unknown as Partial<APIGatewayProxyEventV2>;
+
 // 1x1 transparent PNG.
 const PNG_B64 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==';
 const DATA_URI = `data:image/png;base64,${PNG_B64}`;
@@ -74,6 +81,7 @@ beforeEach(() => {
   sfnSend.mockReset().mockResolvedValue({ executionArn: 'arn:aws:states:us-east-1:123:execution:sm:name' });
   process.env.STATE_MACHINE_ARN = 'arn:aws:states:us-east-1:123:stateMachine:sm';
   process.env.MIN_BALANCE_USD = '1';
+  process.env.TEST_ASSET_URL = 'https://example.com/sofa.glb';
   getBalance.mockReset().mockResolvedValue(1);
 });
 
@@ -149,5 +157,67 @@ describe('create-job', () => {
     expect(res.statusCode).toBe(202);
     expect(JSON.parse(res.body)).toEqual({ job_id: '01JEXISTING' });
     expect(getBalance).not.toHaveBeenCalled();
+  });
+
+  describe('test mode (public test key user)', () => {
+    it('returns an already-SUCCEEDED job with the fixed asset, no billing or pipeline', async () => {
+      const res = await call({ type: 'text-to-3d-preview', input: { prompt: 'test' } }, TEST_MODE);
+
+      expect(res.statusCode).toBe(202);
+      const { job_id } = JSON.parse(res.body);
+      expect(putTask).toHaveBeenCalledTimes(1);
+      const record = putTask.mock.calls[0]![0];
+      expect(record.task_id).toBe(job_id);
+      expect(record.status).toBe('SUCCEEDED');
+      expect(record.progress).toBe(100);
+      expect(record.model_urls).toEqual({ glb: 'https://example.com/sofa.glb' });
+      expect(record.finished_at).toBeTruthy();
+      expect(record.inference_started_at).toBeUndefined();
+      expect(record.execution_arn).toBeUndefined();
+      expect(record.user_id).toBe('testmode');
+      expect(record.source).toBe('api');
+      expect(getBalance).not.toHaveBeenCalled();
+      expect(sfnSend).not.toHaveBeenCalled();
+      expect(updateTask).not.toHaveBeenCalled();
+    });
+
+    it('accepts text-to-3d-refine with an arbitrary preview_task_id (no parent lookup)', async () => {
+      const res = await call(
+        { type: 'text-to-3d-refine', input: { preview_task_id: 'not-a-real-job' } },
+        TEST_MODE,
+      );
+
+      expect(res.statusCode).toBe(202);
+      expect(getTask).not.toHaveBeenCalled();
+      const record = putTask.mock.calls[0]![0];
+      expect(record.status).toBe('SUCCEEDED');
+      expect(sfnSend).not.toHaveBeenCalled();
+    });
+
+    it('idempotent replays return the same job_id without re-persisting', async () => {
+      const created: unknown[] = [];
+      putTask.mockImplementation(async (record) => {
+        created.push(record);
+      });
+      findByIdempotencyKey.mockImplementation(async () => created[0] ?? null);
+      const body = { type: 'text-to-3d-preview', input: { prompt: 'test' }, idempotency_key: 'test-k1' };
+      const first = await call(body, TEST_MODE);
+      const second = await call(body, TEST_MODE);
+
+      expect(first.statusCode).toBe(202);
+      expect(second.statusCode).toBe(202);
+      expect(JSON.parse(second.body).job_id).toBe(JSON.parse(first.body).job_id);
+      expect(putTask).toHaveBeenCalledTimes(1);
+    });
+
+    it('offloads data-URI uploads before persisting the SUCCEEDED record', async () => {
+      const res = await call({ type: 'image-to-3d', input: { image_urls: [DATA_URI] } }, TEST_MODE);
+
+      expect(res.statusCode).toBe(202);
+      expect(offloadDataUri).toHaveBeenCalledTimes(1);
+      const record = putTask.mock.calls[0]![0];
+      expect(record.input.image_urls).toEqual(['s3://work-bucket/tasks/01JOFFLOAD00/uploads/0']);
+      expect(record.status).toBe('SUCCEEDED');
+    });
   });
 });
