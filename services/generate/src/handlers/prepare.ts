@@ -3,6 +3,7 @@ import { getTask, updateTask } from '../lib/tasks-repo.js';
 import { enqueueWebhook } from '../lib/webhook-queue.js';
 import { requireEnv } from '../lib/env.js';
 import { MAX_FETCH_IMAGE_BYTES } from '../lib/data-uris.js';
+import type { PrecisionModel } from '../lib/types.js';
 
 const s3 = new S3Client({});
 
@@ -13,6 +14,8 @@ interface PrepareInput {
 export interface PipelineContext {
   task_id: string;
   postprocess: string;
+  /** Inference engine for this task (absent on legacy records = v1). */
+  model: PrecisionModel;
 }
 
 /**
@@ -80,5 +83,6 @@ export async function handler(event: PrepareInput): Promise<PipelineContext> {
   return {
     task_id: task.task_id,
     postprocess: process.env.POSTPROCESS_MODE ?? 'lite',
+    model: task.model ?? 'precision-v1',
   };
 }

@@ -1,6 +1,8 @@
 import {
   CreateJobRequest,
   CreateTaskRequest,
+  PRECISION_MODELS,
+  PrecisionModel,
   TASK_TYPES,
   TaskType,
 } from './types.js';
@@ -16,6 +18,22 @@ export class ValidationError extends Error {
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const MAX_PROMPT_LENGTH = 600;
 const MAX_IMAGES = 4;
+
+/**
+ * Optional `model` field, shared by the task and job validators: absent =
+ * precision-v1 (the default engine); any other value must be a known engine
+ * or the request is rejected with the standard ValidationError shape.
+ */
+function resolveModel(req: Record<string, unknown>): PrecisionModel {
+  const model = req.model;
+  if (model === undefined) {
+    return 'precision-v1';
+  }
+  if (typeof model !== 'string' || !PRECISION_MODELS.includes(model as PrecisionModel)) {
+    throw new ValidationError(`model must be one of: ${PRECISION_MODELS.join(', ')}`);
+  }
+  return model as PrecisionModel;
+}
 
 function assertHttpUrl(value: string, field: string): void {
   let parsed: URL;
@@ -126,6 +144,7 @@ export function validateCreateTask(body: unknown): CreateTaskRequest {
   }
 
   const idempotencyKey = req.idempotency_key;
+  const model = resolveModel(req);
   if (idempotencyKey !== undefined && (typeof idempotencyKey !== 'string' || idempotencyKey.length === 0 || idempotencyKey.length > 256)) {
     throw new ValidationError('idempotency_key must be a non-empty string of at most 256 characters');
   }
@@ -136,6 +155,7 @@ export function validateCreateTask(body: unknown): CreateTaskRequest {
     options: (req.options ?? {}) as CreateTaskRequest['options'],
     output: output as CreateTaskRequest['output'],
     idempotency_key: idempotencyKey as string | undefined,
+    model,
   };
 }
 
@@ -167,6 +187,7 @@ export function validateCreateJob(body: unknown): CreateJobRequest {
   validateTaskInput(type, input, true);
 
   const idempotencyKey = req.idempotency_key;
+  const model = resolveModel(req);
   if (idempotencyKey !== undefined && (typeof idempotencyKey !== 'string' || idempotencyKey.length === 0 || idempotencyKey.length > 256)) {
     throw new ValidationError('idempotency_key must be a non-empty string of at most 256 characters');
   }
@@ -176,5 +197,6 @@ export function validateCreateJob(body: unknown): CreateJobRequest {
     input: input as CreateJobRequest['input'],
     options: (req.options ?? {}) as CreateJobRequest['options'],
     idempotency_key: idempotencyKey as string | undefined,
+    model,
   };
 }
