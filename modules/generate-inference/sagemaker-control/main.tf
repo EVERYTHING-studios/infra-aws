@@ -64,7 +64,11 @@ locals {
   # Both chains' endpoints — the dispatcher/sentinel policies cover whichever
   # chain a task's model routes it to.
   all_endpoints = concat(var.endpoints, var.endpoints_pixal3d)
-  pixal_chain   = length(var.endpoints_pixal3d) > 0
+  # Static gate (var.pixal3d_enabled), NOT length(var.endpoints_pixal3d):
+  # the endpoints list is apply-time unknown while the v2 regional stacks
+  # are being created, and count/for_each gates must be known at plan time.
+  # var.pixal3d_enabled => the list is non-empty by construction.
+  pixal_chain = var.pixal3d_enabled
 
   # Region-shared view of the endpoint list (buckets + topic ARNs are
   # identical for every endpoint in a region). Grouped with the ellipsis

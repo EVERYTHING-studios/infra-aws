@@ -437,6 +437,7 @@ module "sagemaker_control" {
   region_priority    = local.region_priority
   endpoints          = local.endpoint_priority
   endpoints_pixal3d  = local.endpoint_priority_pixal3d
+  pixal3d_enabled    = var.pixal3d_enabled
   tasks_table_name   = var.tasks_table_name
   tasks_table_arn    = var.tasks_table_arn
   work_bucket_name   = var.work_bucket_name

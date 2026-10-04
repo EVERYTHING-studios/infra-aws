@@ -53,6 +53,12 @@ variable "endpoints_pixal3d" {
   default = []
 }
 
+variable "pixal3d_enabled" {
+  description = "Static plan-time gate for the Precision v2 (Pixal3D) chain (parent's pixal3d_enabled). Gates the v2 election SSM params and SNS Lambda permissions via count/for_each, which must be known at plan time — length(endpoints_pixal3d) is apply-time unknown while the v2 regional stacks are being created."
+  type        = bool
+  default     = false
+}
+
 variable "tasks_table_name" {
   type = string
 }

@@ -43,3 +43,15 @@ variable "sagemaker_candidate_regions" {
   type        = list(string)
   default     = ["us-east-1"]
 }
+
+variable "pixal3d_enabled" {
+  description = "Deploy the Precision v2 (Pixal3D) SageMaker chains alongside the v1 (TRELLIS) chains (modules/generate-inference pixal3d_enabled — per-region stacks with model_token 'pixal3d', shared image/buckets, own endpoints/topics/scaling, weights SSM param /trellis2image/{env}/weights/pixal3d_s3_uri)."
+  type        = bool
+  default     = false
+}
+
+variable "pixal3d_instance_types" {
+  description = "Instance types for the Precision v2 (Pixal3D) chains — same semantics as sagemaker_instance_types (list order = cold-price chain order; low_vram derived per type in sagemaker-region)."
+  type        = list(string)
+  default     = ["ml.g5.2xlarge", "ml.g6e.2xlarge"]
+}
