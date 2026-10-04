@@ -7,7 +7,12 @@ import {
 import { DynamoDBClient, ConditionalCheckFailedException } from '@aws-sdk/client-dynamodb';
 import { DynamoDBDocumentClient, QueryCommand, UpdateCommand } from '@aws-sdk/lib-dynamodb';
 import { requireEnv } from '../lib/env.js';
-import { parseEndpointConfig, dispatchToRegion, VARIANT_NAME, type EndpointConfig } from '../lib/sagemaker.js';
+import {
+  parseEndpointConfig,
+  parseOptionalEndpointConfig,
+  dispatchToRegion,
+  type EndpointConfig,
+} from '../lib/sagemaker.js';
 import { enqueueWebhook } from '../lib/webhook-queue.js';
 import type { TaskRecord } from '../lib/types.js';
 
@@ -27,7 +32,11 @@ const docClient = DynamoDBDocumentClient.from(new DynamoDBClient({}), {
  * attempts. This sentinel therefore watches live evidence from every
  * configured (region x instance type) endpoint + scaling activities and
  * elects the active endpoint automatically, in SAGEMAKER_ENDPOINTS order
- * (the cold-price chain: type-major, region-minor):
+ * (the cold-price chain: type-major, region-minor). The same pass runs
+ * independently per precision chain — v1 (SAGEMAKER_ENDPOINTS, trellis) and,
+ * when configured, v2 (SAGEMAKER_ENDPOINTS_PIXAL3D, pixal3d) with its own
+ * election SSM params; tasks are partitioned by their own `model` so a
+ * stranded task is only ever rescued within its chain:
  *
  * Classification per endpoint:
  *   FAILED       endpoint status Failed (never self-heals; needs manual recreate)
@@ -90,7 +99,7 @@ async function describeRegion(conf: EndpointConfig): Promise<EndpointFacts> {
   const activities = await aas.send(
     new DescribeScalingActivitiesCommand({
       ServiceNamespace: 'sagemaker',
-      ResourceId: `endpoint/${conf.endpointName}/variant/${VARIANT_NAME}`,
+      ResourceId: `endpoint/${conf.endpointName}/variant/${conf.variantName}`,
       MaxResults: 20,
     }),
   );
@@ -212,19 +221,31 @@ async function queryStrandedTasks(tableName: string): Promise<TaskRecord[]> {
  * per-inference start event, so a running instance is the best available
  * signal. Guarded by `#status = :queued` so the SageMaker callback (which sets
  * a terminal status directly) always wins the race.
+ *
+ * The live instance belongs to ONE precision chain, so promotion is filtered
+ * to that chain's tasks: absent `model` counts as precision-v1 (pre-v2
+ * records). Without the filter, a live v2 endpoint in a region would promote
+ * v1 tasks still parked on that region's dead v1 endpoint.
  */
 async function promoteQueuedTasksInRegion(
   tableName: string,
   region: string,
-  scaleUpStart?: Date,
+  scaleUpStart: Date | undefined,
+  model: 'precision-v1' | 'precision-v2',
 ): Promise<number> {
   const queued = await docClient.send(
     new QueryCommand({
       TableName: tableName,
       IndexName: 'gsi2',
       KeyConditionExpression: 'gsi2pk = :status',
-      ExpressionAttributeValues: { ':status': 'STATUS#QUEUED', ':region': region },
-      FilterExpression: 'attribute_exists(sagemaker_task_token) AND sagemaker_region = :region',
+      ExpressionAttributeValues: {
+        ':status': 'STATUS#QUEUED',
+        ':region': region,
+        ':model': model,
+      },
+      FilterExpression:
+        'attribute_exists(sagemaker_task_token) AND sagemaker_region = :region AND ' +
+        (model === 'precision-v1' ? '(attribute_not_exists(model) OR model = :model)' : 'model = :model'),
       Limit: 100,
     }),
   );
@@ -278,18 +299,28 @@ async function promoteQueuedTasksInRegion(
   return promoted;
 }
 
-export async function handler(): Promise<{
+interface ChainResult {
   active_endpoint: string;
   flipped: boolean;
   classes: Record<string, RegionClass>;
   rescued: number;
   promoted: number;
-}> {
-  const configs = parseEndpointConfig(requireEnv('SAGEMAKER_ENDPOINTS'));
-  const activeParam = requireEnv('ACTIVE_ENDPOINT_PARAM');
-  const lastFlipParam = requireEnv('LAST_FLIP_PARAM');
-  const cooldownSeconds = Number(process.env.FLIP_COOLDOWN_SECONDS ?? '300');
+}
 
+/**
+ * One precision chain's election + rescue + promotion pass. The chains are
+ * fully independent: separate endpoint lists, separate active_endpoint /
+ * last_flip SSM params, separate cooldowns. `stranded` is this chain's slice
+ * of the handler's single stranded-task query (partitioned by task.model).
+ */
+async function runChain(
+  configs: EndpointConfig[],
+  activeParam: string,
+  lastFlipParam: string,
+  cooldownSeconds: number,
+  model: 'precision-v1' | 'precision-v2',
+  stranded: TaskRecord[],
+): Promise<ChainResult> {
   // Read the current election: the stored value is an endpoint NAME (unique
   // per region x type). Unknown/absent -> chain head (first configured).
   const storedActive = await getParameterValue(activeParam);
@@ -360,7 +391,6 @@ export async function handler(): Promise<{
   const activeState = states.find((s) => s.conf.endpointName === activeEndpoint);
   if (activeState && activeState.class === 'HEALTHY') {
     const tableName = requireEnv('TASKS_TABLE');
-    const stranded = await queryStrandedTasks(tableName);
     for (const task of stranded) {
       const taskRegion = task.sagemaker_region ?? 'us-east-1';
       if (taskRegion === activeState.conf.region) continue;
@@ -386,9 +416,10 @@ export async function handler(): Promise<{
   }
 
   // ---- queued-task promotion --------------------------------------------
-  // Any region with a live instance has (or is about to) pick up its queued
-  // requests: flip them to IN_PROGRESS. Checked for every healthy region,
-  // not just the active one — re-dispatched rescues land elsewhere.
+  // Any region with a live instance of THIS chain has (or is about to) pick
+  // up its queued requests: flip them to IN_PROGRESS. Checked for every
+  // healthy region, not just the active one — re-dispatched rescues land
+  // elsewhere.
   const tableForPromotion = requireEnv('TASKS_TABLE');
   for (const s of states) {
     if (s.class !== 'HEALTHY' || s.current < 1) continue;
@@ -396,8 +427,47 @@ export async function handler(): Promise<{
       tableForPromotion,
       s.conf.region,
       scaleUpStartByEndpoint[s.conf.endpointName],
+      model,
     );
   }
 
   return { active_endpoint: activeEndpoint, flipped, classes, rescued, promoted };
+}
+
+export async function handler(): Promise<
+  ChainResult & {
+    /** The v2 (Pixal3D) chain's result — present only when that chain is configured. */
+    pixal3d?: ChainResult;
+  }
+> {
+  const v1Configs = parseEndpointConfig(requireEnv('SAGEMAKER_ENDPOINTS'));
+  const v2Configs = parseOptionalEndpointConfig(process.env.SAGEMAKER_ENDPOINTS_PIXAL3D);
+  const cooldownSeconds = Number(process.env.FLIP_COOLDOWN_SECONDS ?? '300');
+
+  // One stranded-task query shared by both chains, partitioned by the task's
+  // own model: a v1 task is never re-dispatched onto the v2 chain and vice
+  // versa. Absent model = precision-v1 (pre-v2 records).
+  const tableName = requireEnv('TASKS_TABLE');
+  const stranded = await queryStrandedTasks(tableName);
+
+  const v1 = await runChain(
+    v1Configs,
+    requireEnv('ACTIVE_ENDPOINT_PARAM'),
+    requireEnv('LAST_FLIP_PARAM'),
+    cooldownSeconds,
+    'precision-v1',
+    stranded.filter((t) => (t.model ?? 'precision-v1') === 'precision-v1'),
+  );
+
+  if (v2Configs.length === 0) return v1;
+
+  const v2 = await runChain(
+    v2Configs,
+    requireEnv('ACTIVE_ENDPOINT_PARAM_PIXAL3D'),
+    requireEnv('LAST_FLIP_PARAM_PIXAL3D'),
+    cooldownSeconds,
+    'precision-v2',
+    stranded.filter((t) => t.model === 'precision-v2'),
+  );
+  return { ...v1, pixal3d: v2 };
 }

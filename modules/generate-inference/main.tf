@@ -431,16 +431,17 @@ module "sagemaker_control" {
   count  = var.inference_backend == "sagemaker" ? 1 : 0
   source = "./sagemaker-control"
 
-  name_prefix       = var.name_prefix
-  env               = var.env
-  region_names      = local.region_names
-  region_priority   = local.region_priority
-  endpoints         = local.endpoint_priority
-  tasks_table_name  = var.tasks_table_name
-  tasks_table_arn   = var.tasks_table_arn
-  work_bucket_name  = var.work_bucket_name
-  work_bucket_arn   = var.work_bucket_arn
-  dist_dir          = var.dist_dir
-  state_machine_arn = local.pipeline_state_machine_arn
-  postprocess_mode  = var.postprocess_mode
+  name_prefix        = var.name_prefix
+  env                = var.env
+  region_names       = local.region_names
+  region_priority    = local.region_priority
+  endpoints          = local.endpoint_priority
+  endpoints_pixal3d  = local.endpoint_priority_pixal3d
+  tasks_table_name   = var.tasks_table_name
+  tasks_table_arn    = var.tasks_table_arn
+  work_bucket_name   = var.work_bucket_name
+  work_bucket_arn    = var.work_bucket_arn
+  dist_dir           = var.dist_dir
+  state_machine_arn  = local.pipeline_state_machine_arn
+  postprocess_mode   = var.postprocess_mode
 }

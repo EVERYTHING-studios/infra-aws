@@ -15,22 +15,32 @@ import { SageMakerRuntimeClient, InvokeEndpointAsyncCommand } from '@aws-sdk/cli
 import type { TaskRecord } from './types.js';
 import { requireEnv } from './env.js';
 
-/** Single async endpoint variant name (set in the sagemaker-region Terraform module). */
-export const VARIANT_NAME = 'trellis';
-
+/**
+ * Single async endpoint entry. `variantName` is the SageMaker production
+ * variant on that endpoint ('trellis' on every v1 endpoint, 'pixal3d' on
+ * every v2 endpoint — set in the sagemaker-region Terraform module); it keys
+ * the autoscaling ResourceId when the sentinel inspects scaling activities.
+ */
 export interface EndpointConfig {
   region: string;
   instanceType: string;
   endpointName: string;
   inputBucket: string;
+  variantName: string;
 }
 
 /**
- * Parse the `SAGEMAKER_ENDPOINTS` env (JSON array of endpoint entries):
- * `[{"region":"us-east-1","instanceType":"g5","endpointName":"...","inputBucket":"..."}]`.
+ * Parse a chain's endpoint list env (JSON array of endpoint entries):
+ * `[{"region":"us-east-1","instanceType":"g5","endpointName":"...","inputBucket":"...","variantName":"trellis"}]`.
  * Array order = the configured chain priority (type-major: instance types in
  * cold-price chain order from the env tfvars, regions in
- * sagemaker_candidate_regions priority order within each type).
+ * sagemaker_candidate_regions priority order within each type). `variantName`
+ * defaults to 'trellis' when absent (pre-v2 env shapes).
+ *
+ * Used for the v1 chain (`SAGEMAKER_ENDPOINTS`, always configured) and the
+ * v2 chain (`SAGEMAKER_ENDPOINTS_PIXAL3D`) — the duplicate (region,
+ * instanceType) check is per chain, so the two chains' overlapping
+ * (region, type) pairs are fine.
  */
 export function parseEndpointConfig(raw: string): EndpointConfig[] {
   let parsed: unknown;
@@ -39,9 +49,30 @@ export function parseEndpointConfig(raw: string): EndpointConfig[] {
   } catch {
     throw new Error(`SAGEMAKER_ENDPOINTS is not valid JSON: ${raw}`);
   }
+  return parseEndpointEntries(parsed);
+}
+
+/**
+ * Optional-chain variant: unset, empty, or `[]` env means the chain is not
+ * deployed (e.g. SAGEMAKER_ENDPOINTS_PIXAL3D on a v2-off environment, where
+ * Terraform emits an empty JSON array).
+ */
+export function parseOptionalEndpointConfig(raw: string | undefined): EndpointConfig[] {
+  if (!raw) return [];
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new Error(`SAGEMAKER_ENDPOINTS is not valid JSON: ${raw}`);
+  }
+  if (Array.isArray(parsed) && parsed.length === 0) return [];
+  return parseEndpointEntries(parsed);
+}
+
+function parseEndpointEntries(parsed: unknown): EndpointConfig[] {
   if (!Array.isArray(parsed)) {
     throw new Error(
-      `SAGEMAKER_ENDPOINTS must be a JSON array of {region, instanceType, endpointName, inputBucket} entries: ${raw}`,
+      `SAGEMAKER_ENDPOINTS must be a JSON array of {region, instanceType, endpointName, inputBucket} entries: ${JSON.stringify(parsed)}`,
     );
   }
   const configs = parsed.map((value) => {
@@ -50,7 +81,7 @@ export function parseEndpointConfig(raw: string): EndpointConfig[] {
         `SAGEMAKER_ENDPOINTS entries must be objects with region, instanceType, endpointName and inputBucket: ${JSON.stringify(value)}`,
       );
     }
-    const { region, instanceType, endpointName, inputBucket } = value as Record<string, unknown>;
+    const { region, instanceType, endpointName, inputBucket, variantName } = value as Record<string, unknown>;
     if (
       typeof region !== 'string' ||
       typeof instanceType !== 'string' ||
@@ -61,7 +92,10 @@ export function parseEndpointConfig(raw: string): EndpointConfig[] {
         `SAGEMAKER_ENDPOINTS entry is missing string region/instanceType/endpointName/inputBucket: ${JSON.stringify(value)}`,
       );
     }
-    return { region, instanceType, endpointName, inputBucket };
+    if (variantName !== undefined && typeof variantName !== 'string') {
+      throw new Error(`SAGEMAKER_ENDPOINTS entry variantName must be a string: ${JSON.stringify(value)}`);
+    }
+    return { region, instanceType, endpointName, inputBucket, variantName: variantName ?? 'trellis' };
   });
   // Duplicate (region, instanceType) pairs are misconfiguration — the same
   // type deployed twice in one region. Multiple entries per region are
@@ -71,7 +105,9 @@ export function parseEndpointConfig(raw: string): EndpointConfig[] {
   );
   if (dupes.length > 0) {
     throw new Error(
-      `SAGEMAKER_ENDPOINTS contains duplicate (region, instanceType) pairs: ${dupes.map((c) => `${c.region}/${c.instanceType}`).join(', ')}`,
+      `SAGEMAKER_ENDPOINTS contains duplicate (region, instanceType) pairs: ${dupes
+        .map((c) => `${c.region}/${c.instanceType}`)
+        .join(', ')}`,
     );
   }
   if (configs.length === 0) {

@@ -19,7 +19,7 @@ variable "region_priority" {
 }
 
 variable "endpoints" {
-  description = "Every deployed (region x instance type) endpoint in the parent's type-major chain-priority order (coldest-cheapest type first, region priority within each type). List order = the sentinel's election + failback priority. Region-shared fields (buckets, topic ARNs) repeat per entry of the same region."
+  description = "Every deployed (region x instance type) endpoint of the PRECISION V1 (trellis) chain in the parent's type-major chain-priority order (coldest-cheapest type first, region priority within each type). List order = the sentinel's election + failback priority. Region-shared fields (buckets, topic ARNs) repeat per entry of the same region. variant_name is fixed 'trellis' (emitted into the handlers' env JSON)."
   type = list(object({
     region            = string
     instance_type     = string
@@ -31,7 +31,26 @@ variable "endpoints" {
     output_bucket_arn = string
     success_topic_arn = string
     error_topic_arn   = string
+    variant_name      = optional(string)
   }))
+}
+
+variable "endpoints_pixal3d" {
+  description = "The Precision v2 (Pixal3D) chain's endpoints — same shape and ordering semantics as `endpoints`, variant_name fixed 'pixal3d'. Empty list = the v2 chain is not deployed: its election SSM params, env wiring, and SNS permissions are all omitted."
+  type = list(object({
+    region            = string
+    instance_type     = string
+    token             = string
+    endpoint_name     = string
+    endpoint_arn      = string
+    input_bucket      = string
+    input_bucket_arn  = string
+    output_bucket_arn = string
+    success_topic_arn = string
+    error_topic_arn   = string
+    variant_name      = optional(string)
+  }))
+  default = []
 }
 
 variable "tasks_table_name" {

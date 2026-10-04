@@ -54,3 +54,16 @@ sagemaker_max_capacity = 1
 # (already exist), re-run replicate_artifacts.sh with
 # REPLICATE_REGIONS="us-west-2", then full apply.
 sagemaker_candidate_regions = ["us-east-1", "us-east-2"]
+
+# Precision v2 (Pixal3D) rollout (staging only): deploy the pixal3d chain
+# alongside the v1 TRELLIS chain. API `model: "precision-v2"` routes tasks to
+# it; default (absent) stays precision-v1. The v2 chain shares the v1 image
+# (ECR) and buckets; its weights tar lives under pixal-weights/ and its SSM
+# URI param is /trellis2image/staging/weights/pixal3d_s3_uri — BOTH must
+# exist per candidate region before apply (package_weights.sh /
+# replicate_artifacts.sh with MODEL=pixal3d). Chain: g5 + g6e (same
+# cold-price order and per-type low_vram derivation as v1; g7e omitted for
+# the same Blackwell-capacity reason). Production tfvars deliberately does
+# NOT set this (default false = exact pre-v2 policy JSON, no v2 resources).
+pixal3d_enabled        = true
+pixal3d_instance_types = ["ml.g5.2xlarge", "ml.g6e.2xlarge"]
