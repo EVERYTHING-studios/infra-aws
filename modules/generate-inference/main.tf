@@ -68,12 +68,13 @@ module "stub" {
 # output-bucket ListBucket at CreateModel/CreateEndpointConfig time, so the
 # attach must precede the regional stacks. The region modules depends_on
 # aws_iam_role_policy.sagemaker_execution_static; role -> policy -> regional
-# modules -> control plane is a DAG, not a cycle. Scoped to TRELLIS (weights
-# key trellis-weights/* per package_weights.sh default WEIGHTS_KEY, the
-# trellis2image ECR repo). When a second model lands, decide explicitly
-# whether to broaden this role or add a per-model role — do NOT silently
-# broaden.
-# ------------------------------------------------------------------
+# modules -> control plane is a DAG, not a cycle. The role is shared by BOTH
+# engines (one SageMaker execution role; scoping is per-bucket-prefix and
+# per-topic-suffix): v1 weights read trellis-weights/*, v2 reads
+# pixal-weights/* (package_weights.sh WEIGHTS_KEY per MODEL); topics are
+# -sagemaker-success/-error (v1) and -sagemaker-pixal3d-success/-error (v2).
+# The v2 statements are added only when pixal3d_enabled, so with v2 off the
+# policy JSON is byte-identical to the pre-v2 policy.
 
 data "aws_iam_policy_document" "sagemaker_assume" {
   statement {
@@ -153,6 +154,40 @@ locals {
           output_bucket_arn = try(local.sagemaker_regions[r].output_bucket_arn, null)
           success_topic_arn = try(local.sagemaker_regions[r].success_topic_arn, null)
           error_topic_arn   = try(local.sagemaker_regions[r].error_topic_arn, null)
+          variant_name      = "trellis"
+        }
+      ]
+    ]) : e if e.endpoint_name != null
+  ]
+
+  # Region-keyed descriptors of the Precision v2 (Pixal3D) regional stacks.
+  # Mirrors sagemaker_regions; try() absorbs the out-of-range index when a
+  # gated instance has count = 0.
+  sagemaker_regions_pixal3d = merge(
+    try(module.sagemaker_region_useast1_pixal3d[0].this, {}),
+    try(module.sagemaker_region_useast2_pixal3d[0].this, {}),
+    try(module.sagemaker_region_uswest2_pixal3d[0].this, {}),
+  )
+
+  # Endpoint election priority for the v2 chain — same type-major shape as
+  # endpoint_priority but over var.pixal3d_instance_types and the v2 regional
+  # stacks. The control plane consumes it as a separate chain (per-model
+  # election SSM params); the chains never cross-elect.
+  endpoint_priority_pixal3d = [
+    for e in flatten([
+      for t in var.pixal3d_instance_types : [
+        for r in local.region_priority : {
+          region            = r
+          instance_type     = t
+          token             = local.type_tokens[t]
+          endpoint_name     = try(local.sagemaker_regions_pixal3d[r].endpoints[local.type_tokens[t]].name, null)
+          endpoint_arn      = try(local.sagemaker_regions_pixal3d[r].endpoints[local.type_tokens[t]].arn, null)
+          input_bucket      = try(local.sagemaker_regions_pixal3d[r].input_bucket, null)
+          input_bucket_arn  = try(local.sagemaker_regions_pixal3d[r].input_bucket_arn, null)
+          output_bucket_arn = try(local.sagemaker_regions_pixal3d[r].output_bucket_arn, null)
+          success_topic_arn = try(local.sagemaker_regions_pixal3d[r].success_topic_arn, null)
+          error_topic_arn   = try(local.sagemaker_regions_pixal3d[r].error_topic_arn, null)
+          variant_name      = "pixal3d"
         }
       ]
     ]) : e if e.endpoint_name != null
@@ -166,6 +201,17 @@ data "aws_iam_policy_document" "sagemaker_execution_static" {
   statement {
     actions   = ["s3:GetObject"]
     resources = [for names in values(local.region_bucket_names) : "arn:aws:s3:::${names.weights}/trellis-weights/*"]
+  }
+
+  # Precision v2 weights: same buckets, pixal-weights/* prefix (per
+  # package_weights.sh MODEL=pixal3d). Added only when the v2 chain is
+  # enabled so a v2-off env keeps the exact pre-v2 policy JSON.
+  dynamic "statement" {
+    for_each = var.pixal3d_enabled ? [1] : []
+    content {
+      actions   = ["s3:GetObject"]
+      resources = [for names in values(local.region_bucket_names) : "arn:aws:s3:::${names.weights}/pixal-weights/*"]
+    }
   }
 
   statement {
@@ -191,6 +237,21 @@ data "aws_iam_policy_document" "sagemaker_execution_static" {
         "arn:aws:sns:${r}:${data.aws_caller_identity.current.account_id}:${var.name_prefix}-sagemaker-error",
       ]
     ])
+  }
+
+  # Precision v2 notification topics (sagemaker-region model_suffix
+  # '-pixal3d'). Same conditional as the pixal weights statement.
+  dynamic "statement" {
+    for_each = var.pixal3d_enabled ? [1] : []
+    content {
+      actions = ["sns:Publish"]
+      resources = flatten([
+        for r in local.region_names : [
+          "arn:aws:sns:${r}:${data.aws_caller_identity.current.account_id}:${var.name_prefix}-sagemaker-pixal3d-success",
+          "arn:aws:sns:${r}:${data.aws_caller_identity.current.account_id}:${var.name_prefix}-sagemaker-pixal3d-error",
+        ]
+      ])
+    }
   }
 
   statement {
@@ -286,6 +347,75 @@ module "sagemaker_region_uswest2" {
   max_capacity          = var.sagemaker_max_capacity
 
   # See the useast1 block: orders Model create after the policy attach.
+  execution_role_policy_id = aws_iam_role_policy.sagemaker_execution_static.id
+}
+
+# ------------------------------------------------------------------
+# Precision v2 (Pixal3D) regional stacks: same shared image and the SAME
+# buckets (create_buckets = false — the v1 instance above owns them), own
+# Model/EndpointConfig/Endpoint sets, own SNS topics (-pixal3d suffix), own
+# scaling, and the pixal weights SSM param. Same gating as v1 plus
+# pixal3d_enabled; the pixal weights tar + SSM param must exist per region
+# before apply (package_weights.sh / replicate_artifacts.sh MODEL=pixal3d).
+# ------------------------------------------------------------------
+
+module "sagemaker_region_useast1_pixal3d" {
+  count  = var.inference_backend == "sagemaker" && var.pixal3d_enabled ? 1 : 0
+  source = "./sagemaker-region"
+
+  providers = { aws = aws }
+
+  region                   = "us-east-1"
+  name_prefix              = var.name_prefix
+  env                      = var.env
+  execution_role_arn       = aws_iam_role.sagemaker_execution.arn
+  callback_function_arn    = local.callback_function_arn
+  bucket_names             = local.region_bucket_names["us-east-1"]
+  create_buckets           = false
+  model_token              = "pixal3d"
+  weights_ssm_param        = "/trellis2image/${var.env}/weights/pixal3d_s3_uri"
+  instance_types           = var.pixal3d_instance_types
+  max_capacity             = var.sagemaker_max_capacity
+  execution_role_policy_id = aws_iam_role_policy.sagemaker_execution_static.id
+}
+
+module "sagemaker_region_useast2_pixal3d" {
+  count  = var.inference_backend == "sagemaker" && var.pixal3d_enabled && contains(var.sagemaker_candidate_regions, "us-east-2") ? 1 : 0
+  source = "./sagemaker-region"
+
+  providers = { aws = aws.useast2 }
+
+  region                   = "us-east-2"
+  name_prefix              = var.name_prefix
+  env                      = var.env
+  execution_role_arn       = aws_iam_role.sagemaker_execution.arn
+  callback_function_arn    = local.callback_function_arn
+  bucket_names             = local.region_bucket_names["us-east-2"]
+  create_buckets           = false
+  model_token              = "pixal3d"
+  weights_ssm_param        = "/trellis2image/${var.env}/weights/pixal3d_s3_uri"
+  instance_types           = var.pixal3d_instance_types
+  max_capacity             = var.sagemaker_max_capacity
+  execution_role_policy_id = aws_iam_role_policy.sagemaker_execution_static.id
+}
+
+module "sagemaker_region_uswest2_pixal3d" {
+  count  = var.inference_backend == "sagemaker" && var.pixal3d_enabled && contains(var.sagemaker_candidate_regions, "us-west-2") ? 1 : 0
+  source = "./sagemaker-region"
+
+  providers = { aws = aws.uswest2 }
+
+  region                   = "us-west-2"
+  name_prefix              = var.name_prefix
+  env                      = var.env
+  execution_role_arn       = aws_iam_role.sagemaker_execution.arn
+  callback_function_arn    = local.callback_function_arn
+  bucket_names             = local.region_bucket_names["us-west-2"]
+  create_buckets           = false
+  model_token              = "pixal3d"
+  weights_ssm_param        = "/trellis2image/${var.env}/weights/pixal3d_s3_uri"
+  instance_types           = var.pixal3d_instance_types
+  max_capacity             = var.sagemaker_max_capacity
   execution_role_policy_id = aws_iam_role_policy.sagemaker_execution_static.id
 }
 

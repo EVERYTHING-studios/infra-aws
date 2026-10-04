@@ -41,17 +41,23 @@ region suffix with the region's hyphens stripped — `-useast2` / `-uswest2`
 - **S3 buckets** — async input, async output, and the weights store, each with
   a public-access block and SSE-S3 (`AES256`). Input and output buckets expire
   transient artifacts after 7 days; the weights bucket holds a manually managed
-  `model.tar.gz` and has NO expiry.
+  `model.tar.gz` and has NO expiry. Created only by the bucket-owning (v1)
+  instance (`create_buckets = true`); a Precision-v2 instance of this module
+  passes the same `bucket_names` with `create_buckets = false` and shares them
+  (its weights tar lives under the `pixal-weights/` prefix of the same weights
+  bucket).
 - **Weights SSM parameter** — `/trellis2image/${env}/s3/weights_bucket`,
-  published with this region's bucket name. SSM is regional: the parameter name
-  repeats in every region with region-local values, and
-  `trellis2image/scripts/replicate_artifacts.sh` reads it (in the destination
-  region) to target replication.
-- **SSM data sources** — `/trellis2image/${env}/ecr/image_uri` and
-  `/trellis2image/${env}/weights/s3_uri`, read through the regional provider
-  from this region's own parameter store. In us-east-1 they are written by
-  `push_image.sh` / `package_weights.sh`; in alternate regions by
-  `replicate_artifacts.sh`.
+  published with this region's bucket name (only by the v1 instance). SSM is
+  regional: the parameter name repeats in every region with region-local
+  values, and `trellis2image/scripts/replicate_artifacts.sh` reads it (in the
+  destination region) to target replication.
+- **SSM data sources** — `/trellis2image/${env}/ecr/image_uri` (shared by both
+  engines) and the model's weights URI: `/trellis2image/${env}/weights/s3_uri`
+  (v1 default) or `/trellis2image/${env}/weights/pixal3d_s3_uri` (v2, via
+  `weights_ssm_param`), read through the regional provider from this region's
+  own parameter store. In us-east-1 they are written by `push_image.sh` /
+  `package_weights.sh`; in alternate regions by `replicate_artifacts.sh` (both
+  take `MODEL=`).
 - **Per-type SageMaker resources** — one `aws_sagemaker_model` +
   `aws_sagemaker_endpoint_configuration` + `aws_sagemaker_endpoint` per
   instance type in `var.instance_types` (`for_each`), names token-suffixed.
@@ -60,7 +66,11 @@ region suffix with the region's hyphens stripped — `-useast2` / `-uswest2`
   gain a region suffix (e.g. `...-sagemaker-g5-useast2`) — because the
   sentinel/dispatcher in `sagemaker-control` elect and look up endpoints by
   NAME across the whole (region × type) chain; SageMaker names themselves are
-  only region-scoped. A per-type
+  only region-scoped. With `model_token = "pixal3d"` every per-type name gains
+  a `-pixal3d` model suffix (e.g. `...-sagemaker-pixal3d-g5`), the production
+  variant becomes `pixal3d`, and the container env switches to the v2 engine
+  (`PRECISION_MODEL=pixal3d`, `PIXAL3D_*` keys, `TORCH_HOME` into the weights
+  tar's `torch/` tree). A per-type
   `random_id` suffix on each EndpointConfig name (keepers: image, weights,
   that type's container environment, the instance type — one random_id per
   type so one type's change doesn't rotate the others) lets image/weights
@@ -71,12 +81,16 @@ region suffix with the region's hyphens stripped — `-useast2` / `-uswest2`
   `s3:ListBucket` on the output bucket) never race the bucket create in a
   fresh region. All of a region's endpoints share that region's SNS topics
   (the callback derives the source region from `EventSubscriptionArn`) and
-  output bucket; the variant name stays `trellis` on every endpoint.
+  output bucket; the variant name stays fixed per engine (`trellis` v1,
+  `pixal3d` v2) on every endpoint.
 - **SNS success/error topics** + Lambda subscriptions. The single us-east-1
   callback Lambda (owned by `sagemaker-control`, ARN constructed by the parent
   to break the control ↔ regional reference cycle) is subscribed to both topics
   from every region — SNS cross-region Lambda delivery is supported. The
   callback derives the source region from each record's `EventSubscriptionArn`.
+  A v2 instance's topics are named with the `-pixal3d` model suffix
+  (`${name_prefix}-sagemaker-pixal3d-success` / `-error`) and are subscribed by
+  the same callback Lambda.
 - **Application Auto Scaling** on every endpoint variant with
   `min_capacity = 0` (scale-to-zero), `max_capacity = var.max_capacity`
   (default 2, per endpoint). Scale-up on `HasBacklogWithoutCapacity`

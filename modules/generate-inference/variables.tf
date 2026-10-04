@@ -75,3 +75,23 @@ variable "sagemaker_candidate_regions" {
     error_message = "sagemaker_candidate_regions may only contain us-east-1, us-east-2, us-west-2 (the only regions offering ml.g7e.2xlarge)."
   }
 }
+
+variable "pixal3d_enabled" {
+  description = "Deploy the Precision v2 (Pixal3D) SageMaker chains alongside the v1 (TRELLIS) chains: per-region sagemaker-region instances with model_token 'pixal3d' (shared image/buckets, own endpoints/topics/scaling, pixal weights SSM param). Requires the pixal weights tar + SSM param per region (package_weights.sh / replicate_artifacts.sh with MODEL=pixal3d) BEFORE apply."
+  type        = bool
+  default     = false
+}
+
+variable "pixal3d_instance_types" {
+  description = "Instance types for the Precision v2 (Pixal3D) chains — same semantics as sagemaker_instance_types (list order = cold-price chain order; low_vram derived per type in sagemaker-region). Separate from the v1 chain so v2 can run a narrower set."
+  type        = list(string)
+  default     = ["ml.g5.2xlarge", "ml.g6e.2xlarge"]
+
+  validation {
+    condition = length(var.pixal3d_instance_types) > 0 && alltrue([
+      for t in var.pixal3d_instance_types :
+      contains(["ml.g5.2xlarge", "ml.g6e.2xlarge", "ml.g7e.2xlarge"], t)
+    ])
+    error_message = "pixal3d_instance_types must be non-empty and contain only ml.g5.2xlarge, ml.g6e.2xlarge, or ml.g7e.2xlarge."
+  }
+}

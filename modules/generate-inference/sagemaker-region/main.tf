@@ -35,7 +35,13 @@ terraform {
 }
 
 locals {
-  variant_name = "trellis"
+  # Engine dimension. model_token 'trellis' (default) keeps every v1 name,
+  # SSM read, and variant byte-identical: model_suffix renders empty and
+  # variant_name stays 'trellis'. 'pixal3d' (Precision v2) suffixes every
+  # per-type name with -pixal3d and switches the variant + container env.
+  variant_name = var.model_token
+  model_suffix = var.model_token == "trellis" ? "" : "-${var.model_token}"
+  is_pixal     = var.model_token == "pixal3d"
 
   # SageMaker resource names reject dots: token per chain instance type, used
   # to suffix Model/EndpointConfig/Endpoint/policy/alarm names so each type's
@@ -56,31 +62,58 @@ locals {
   # region-scoped resources.
   region_token = var.region == "us-east-1" ? "" : "-${replace(var.region, "-", "")}"
 
-  # TRELLIS2_LOW_VRAM is derived per instance type (replaces the old low_vram
-  # var): g5's 24 GB VRAM cannot hold all ~17 GB of models resident, so it
-  # keeps models on CPU and swaps per-stage; g6e (45 GB) and g7e (96 GB) load
-  # everything to GPU once at startup.
+  # Low-VRAM derivation is shared by both engines (g5's 24 GB VRAM cannot
+  # hold the full model set resident; g6e/g7e can): the ENV KEY differs —
+  # TRELLIS2_LOW_VRAM (v1) vs PIXAL3D_LOW_VRAM (v2, low-VRAM = 1024 cascade).
   low_vram_by_type = {
     "ml.g5.2xlarge"  = "1"
     "ml.g6e.2xlarge" = "0"
     "ml.g7e.2xlarge" = "0"
   }
+  low_vram_env_key = local.is_pixal ? "PIXAL3D_LOW_VRAM" : "TRELLIS2_LOW_VRAM"
 
-  # Model container environment per instance type: the fixed base merged with
-  # the per-type TRELLIS2_LOW_VRAM. Tracked by the endpoint_config keepers so
-  # a change rolls a new Model + EndpointConfig (blue/green). Defined as a
-  # local to avoid a circular dependency: random_id keepers must not reference
-  # the model resource whose name derives from random_id.hex.
-  model_environment_base = {
+  # Model container environment per instance type: the engine's fixed base
+  # merged with the per-type low-VRAM key and the caller's container_env_extra
+  # (escape hatch; wins over the derived values). Tracked by the
+  # endpoint_config keepers so a change rolls a new Model + EndpointConfig
+  # (blue/green). Defined as a local to avoid a circular dependency:
+  # random_id keepers must not reference the model resource whose name
+  # derives from random_id.hex.
+  model_environment_base = local.is_pixal ? {
+    # Precision v2 (Pixal3D): same shared image; PRECISION_MODEL selects the
+    # engine at container startup. TORCH_HOME points at the NAF torch.hub
+    # tree shipped inside the v2 weights tar (torch/hub/...).
+    PRECISION_MODEL    = "pixal3d"
+    HF_HOME            = "/opt/ml/model"
+    HF_HUB_OFFLINE     = "1"
+    TORCH_HOME         = "/opt/ml/model/torch"
+    PIXAL3D_EAGER_LOAD = "1"
+    } : {
     HF_HOME                = "/opt/ml/model"
     HF_HUB_OFFLINE         = "1"
     TRELLIS2_EAGER_LOAD    = "1"
     TRELLIS2_PIPELINE_TYPE = "1024"
   }
   model_environment = {
-    for t in var.instance_types : t => merge(local.model_environment_base, {
-      TRELLIS2_LOW_VRAM = local.low_vram_by_type[t]
-    })
+    for t in var.instance_types : t => merge(
+      local.model_environment_base,
+      { (local.low_vram_env_key) = local.low_vram_by_type[t] },
+      var.container_env_extra,
+    )
+  }
+
+  # Weights artifact SSM param: the v1 tar by default; the v2 instance
+  # overrides to the pixal tar's param.
+  weights_ssm_param_name = coalesce(var.weights_ssm_param, "/trellis2image/${var.env}/weights/s3_uri")
+
+  # Bucket ARNs: from the created resource when create_buckets (v1 instance),
+  # else constructed from the shared var.bucket_names (S3 bucket ARNs are
+  # exactly arn:aws:s3:::name). Names always come from var.bucket_names — the
+  # v2 instance passes the same object as the v1 instance that owns them.
+  bucket_arns = {
+    input   = var.create_buckets ? aws_s3_bucket.sagemaker_input[0].arn : "arn:aws:s3:::${var.bucket_names.input}"
+    output  = var.create_buckets ? aws_s3_bucket.sagemaker_output[0].arn : "arn:aws:s3:::${var.bucket_names.output}"
+    weights = var.create_buckets ? aws_s3_bucket.sagemaker_weights[0].arn : "arn:aws:s3:::${var.bucket_names.weights}"
   }
 }
 
@@ -88,22 +121,33 @@ locals {
 # S3 buckets: async input, async output, and the weights store. The
 # weights bucket is published to regional SSM (same parameter name in
 # every region); replicate_artifacts.sh reads it to target replication.
+# Only the bucket-owning (v1, create_buckets=true) instance creates these;
+# a sharing (v2) instance skips them and references the same names via
+# var.bucket_names / local.bucket_arns.
 # ------------------------------------------------------------------
 
 resource "aws_s3_bucket" "sagemaker_input" {
+  count = var.create_buckets ? 1 : 0
+
   bucket = var.bucket_names.input
 }
 
 resource "aws_s3_bucket" "sagemaker_output" {
+  count = var.create_buckets ? 1 : 0
+
   bucket = var.bucket_names.output
 }
 
 resource "aws_s3_bucket" "sagemaker_weights" {
+  count = var.create_buckets ? 1 : 0
+
   bucket = var.bucket_names.weights
 }
 
 resource "aws_s3_bucket_public_access_block" "sagemaker_input" {
-  bucket = aws_s3_bucket.sagemaker_input.id
+  count = var.create_buckets ? 1 : 0
+
+  bucket = aws_s3_bucket.sagemaker_input[0].id
 
   block_public_acls       = true
   block_public_policy     = true
@@ -112,7 +156,9 @@ resource "aws_s3_bucket_public_access_block" "sagemaker_input" {
 }
 
 resource "aws_s3_bucket_public_access_block" "sagemaker_output" {
-  bucket = aws_s3_bucket.sagemaker_output.id
+  count = var.create_buckets ? 1 : 0
+
+  bucket = aws_s3_bucket.sagemaker_output[0].id
 
   block_public_acls       = true
   block_public_policy     = true
@@ -121,7 +167,9 @@ resource "aws_s3_bucket_public_access_block" "sagemaker_output" {
 }
 
 resource "aws_s3_bucket_public_access_block" "sagemaker_weights" {
-  bucket = aws_s3_bucket.sagemaker_weights.id
+  count = var.create_buckets ? 1 : 0
+
+  bucket = aws_s3_bucket.sagemaker_weights[0].id
 
   block_public_acls       = true
   block_public_policy     = true
@@ -130,7 +178,9 @@ resource "aws_s3_bucket_public_access_block" "sagemaker_weights" {
 }
 
 resource "aws_s3_bucket_server_side_encryption_configuration" "sagemaker_input" {
-  bucket = aws_s3_bucket.sagemaker_input.id
+  count = var.create_buckets ? 1 : 0
+
+  bucket = aws_s3_bucket.sagemaker_input[0].id
 
   rule {
     apply_server_side_encryption_by_default {
@@ -140,7 +190,9 @@ resource "aws_s3_bucket_server_side_encryption_configuration" "sagemaker_input" 
 }
 
 resource "aws_s3_bucket_server_side_encryption_configuration" "sagemaker_output" {
-  bucket = aws_s3_bucket.sagemaker_output.id
+  count = var.create_buckets ? 1 : 0
+
+  bucket = aws_s3_bucket.sagemaker_output[0].id
 
   rule {
     apply_server_side_encryption_by_default {
@@ -150,7 +202,9 @@ resource "aws_s3_bucket_server_side_encryption_configuration" "sagemaker_output"
 }
 
 resource "aws_s3_bucket_server_side_encryption_configuration" "sagemaker_weights" {
-  bucket = aws_s3_bucket.sagemaker_weights.id
+  count = var.create_buckets ? 1 : 0
+
+  bucket = aws_s3_bucket.sagemaker_weights[0].id
 
   rule {
     apply_server_side_encryption_by_default {
@@ -162,7 +216,9 @@ resource "aws_s3_bucket_server_side_encryption_configuration" "sagemaker_weights
 # Input + output buckets expire transient artifacts after 7 days. The weights
 # bucket holds a manually managed artifact (model.tar.gz) and has NO expiry.
 resource "aws_s3_bucket_lifecycle_configuration" "sagemaker_input" {
-  bucket = aws_s3_bucket.sagemaker_input.id
+  count = var.create_buckets ? 1 : 0
+
+  bucket = aws_s3_bucket.sagemaker_input[0].id
 
   rule {
     id     = "expire-inputs"
@@ -177,7 +233,9 @@ resource "aws_s3_bucket_lifecycle_configuration" "sagemaker_input" {
 }
 
 resource "aws_s3_bucket_lifecycle_configuration" "sagemaker_output" {
-  bucket = aws_s3_bucket.sagemaker_output.id
+  count = var.create_buckets ? 1 : 0
+
+  bucket = aws_s3_bucket.sagemaker_output[0].id
 
   rule {
     id     = "expire-outputs"
@@ -192,10 +250,14 @@ resource "aws_s3_bucket_lifecycle_configuration" "sagemaker_output" {
 }
 
 # Weights bucket SSM param — regional (same name, region-local value).
+# Written only by the bucket-owning (v1) instance; a sharing (v2) instance
+# must not manage (or clobber) it.
 resource "aws_ssm_parameter" "weights_bucket" {
+  count = var.create_buckets ? 1 : 0
+
   name  = "/trellis2image/${var.env}/s3/weights_bucket"
   type  = "String"
-  value = aws_s3_bucket.sagemaker_weights.id
+  value = var.bucket_names.weights
 }
 
 # ------------------------------------------------------------------
@@ -209,7 +271,7 @@ data "aws_ssm_parameter" "image_uri" {
 }
 
 data "aws_ssm_parameter" "weights_s3_uri" {
-  name = "/trellis2image/${var.env}/weights/s3_uri"
+  name = local.weights_ssm_param_name
 }
 
 # ------------------------------------------------------------------
@@ -240,7 +302,7 @@ resource "random_id" "endpoint_config" {
 resource "aws_sagemaker_model" "this" {
   for_each = toset(var.instance_types)
 
-  name               = "${var.name_prefix}-sagemaker-model-${local.type_token[each.key]}-${random_id.endpoint_config[each.key].hex}"
+  name               = "${var.name_prefix}-sagemaker-model${local.model_suffix}-${local.type_token[each.key]}-${random_id.endpoint_config[each.key].hex}"
   execution_role_arn = var.execution_role_arn
 
   primary_container {
@@ -285,7 +347,7 @@ resource "aws_sagemaker_model" "this" {
 resource "aws_sagemaker_endpoint_configuration" "this" {
   for_each = toset(var.instance_types)
 
-  name = "${var.name_prefix}-sagemaker-${local.type_token[each.key]}-${random_id.endpoint_config[each.key].hex}"
+  name = "${var.name_prefix}-sagemaker${local.model_suffix}-${local.type_token[each.key]}-${random_id.endpoint_config[each.key].hex}"
 
   production_variants {
     variant_name           = local.variant_name
@@ -306,7 +368,7 @@ resource "aws_sagemaker_endpoint_configuration" "this" {
     }
 
     output_config {
-      s3_output_path = "s3://${aws_s3_bucket.sagemaker_output.bucket}/"
+      s3_output_path = "s3://${var.bucket_names.output}/"
 
       notification_config {
         success_topic = aws_sns_topic.success.arn
@@ -334,7 +396,7 @@ resource "aws_sagemaker_endpoint_configuration" "this" {
 resource "aws_sagemaker_endpoint" "this" {
   for_each = toset(var.instance_types)
 
-  name                 = "${var.name_prefix}-sagemaker-${local.type_token[each.key]}${local.region_token}"
+  name                 = "${var.name_prefix}-sagemaker${local.model_suffix}-${local.type_token[each.key]}${local.region_token}"
   endpoint_config_name = aws_sagemaker_endpoint_configuration.this[each.key].name
 }
 
@@ -347,11 +409,11 @@ resource "aws_sagemaker_endpoint" "this" {
 # ------------------------------------------------------------------
 
 resource "aws_sns_topic" "success" {
-  name = "${var.name_prefix}-sagemaker-success"
+  name = "${var.name_prefix}-sagemaker${local.model_suffix}-success"
 }
 
 resource "aws_sns_topic" "error" {
-  name = "${var.name_prefix}-sagemaker-error"
+  name = "${var.name_prefix}-sagemaker${local.model_suffix}-error"
 }
 
 resource "aws_sns_topic_subscription" "success" {
@@ -388,7 +450,7 @@ resource "aws_appautoscaling_target" "this" {
 resource "aws_appautoscaling_policy" "scale_up" {
   for_each = toset(var.instance_types)
 
-  name               = "${var.name_prefix}-sagemaker-scale-up-${local.type_token[each.key]}"
+  name               = "${var.name_prefix}-sagemaker${local.model_suffix}-scale-up-${local.type_token[each.key]}"
   resource_id        = aws_appautoscaling_target.this[each.key].resource_id
   service_namespace  = aws_appautoscaling_target.this[each.key].service_namespace
   scalable_dimension = aws_appautoscaling_target.this[each.key].scalable_dimension
@@ -407,7 +469,7 @@ resource "aws_appautoscaling_policy" "scale_up" {
 resource "aws_cloudwatch_metric_alarm" "backlog" {
   for_each = toset(var.instance_types)
 
-  alarm_name          = "${var.name_prefix}-sagemaker-backlog-${local.type_token[each.key]}"
+  alarm_name          = "${var.name_prefix}-sagemaker${local.model_suffix}-backlog-${local.type_token[each.key]}"
   alarm_description   = "Scale up the SageMaker async endpoint when requests are queued with no capacity."
   namespace           = "AWS/SageMaker"
   metric_name         = "HasBacklogWithoutCapacity"
@@ -433,7 +495,7 @@ resource "aws_cloudwatch_metric_alarm" "backlog" {
 resource "aws_appautoscaling_policy" "scale_down" {
   for_each = toset(var.instance_types)
 
-  name               = "${var.name_prefix}-sagemaker-scale-down-${local.type_token[each.key]}"
+  name               = "${var.name_prefix}-sagemaker${local.model_suffix}-scale-down-${local.type_token[each.key]}"
   resource_id        = aws_appautoscaling_target.this[each.key].resource_id
   service_namespace  = aws_appautoscaling_target.this[each.key].service_namespace
   scalable_dimension = aws_appautoscaling_target.this[each.key].scalable_dimension
@@ -452,7 +514,7 @@ resource "aws_appautoscaling_policy" "scale_down" {
 resource "aws_cloudwatch_metric_alarm" "scale_to_zero" {
   for_each = toset(var.instance_types)
 
-  alarm_name          = "${var.name_prefix}-sagemaker-scale-to-zero-${local.type_token[each.key]}"
+  alarm_name          = "${var.name_prefix}-sagemaker${local.model_suffix}-scale-to-zero-${local.type_token[each.key]}"
   alarm_description   = "Scale the SageMaker async endpoint to zero when idle (no active invocations for 3 minutes)."
   namespace           = "EverythingStudios/SageMaker"
   metric_name         = "EndpointIdle"
