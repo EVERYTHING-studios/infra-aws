@@ -5,12 +5,21 @@ SageMaker inference backend. The parent `generate-inference` module
 instantiates this module ONCE (default provider) when
 `inference_backend = "sagemaker"`; the regional stacks (buckets, per-type
 Model/EndpointConfig/Endpoint sets, SNS topics, autoscaling) live in the
-sibling `sagemaker-region/` module, one instance per candidate region
-(us-east-1, us-east-2, us-west-2 — the only regions where SageMaker offers
-`ml.g7e.2xlarge`). This module receives the full (region × instance type)
-endpoint list as `endpoints`, in the parent's type-major chain-priority
-order, so its IAM policies and Lambda env wiring cover every chain endpoint
-without further edits.
+sibling `sagemaker-region/` module, one instance per candidate region per
+precision chain (us-east-1, us-east-2, us-west-2 — the only regions where
+SageMaker offers `ml.g7e.2xlarge`). This module receives the full
+(region × instance type) endpoint list as `endpoints`, in the parent's
+type-major chain-priority order, so its IAM policies and Lambda env wiring
+cover every chain endpoint without further edits.
+
+**Precision chains.** The same control plane serves BOTH engines: the v1
+TRELLIS chain (`endpoints`, variant `trellis`) and, when deployed, the v2
+Pixal3D chain (`endpoints_pixal3d`, variant `pixal3d` — see
+`pixal3d_enabled` in the parent). Each chain elects independently with its
+own SSM params; tasks are routed by their `model` field
+(`precision-v1` default, `precision-v2` for Pixal3D). With
+`endpoints_pixal3d = []` every v2 resource/env/permission is absent and the
+module is byte-identical to its pre-v2 form.
 
 Why a control plane at all: AWS exposes no "capacity availability" API, and
 SageMaker has no native multi-region or multi-instance-type routing. An
@@ -39,7 +48,11 @@ and the target region (`sagemaker_region`, bookkeeping only — the callback
 derives truth from the SNS subscription ARN) are stored on the task record.
 
 Env: `TASKS_TABLE`, `WORK_BUCKET`, `SAGEMAKER_ENDPOINTS`,
-`ACTIVE_ENDPOINT_PARAM`.
+`ACTIVE_ENDPOINT_PARAM`, `SAGEMAKER_ENDPOINTS_PIXAL3D`,
+`ACTIVE_ENDPOINT_PARAM_PIXAL3D`. The task's `model`
+(`event.model ?? task.model ?? precision-v1`) selects the chain: v2 tasks
+read the pixal3d param and endpoint list; a v2 task on a v2-off environment
+fails fast with a clear error.
 
 ### Callback (`...-sagemaker-callback`)
 
@@ -79,18 +92,25 @@ publication keeps every scale-to-zero alarm fed and lets abandoned endpoints
 drain after a flip. Safe default 0 on error — never scale down on monitoring
 failure.
 
-Env: `TASKS_TABLE`, `SAGEMAKER_ENDPOINTS`.
+Env: `TASKS_TABLE`, `SAGEMAKER_ENDPOINTS`, `SAGEMAKER_ENDPOINTS_PIXAL3D`
+(both chains' endpoints are fed; `[]` = the v2 chain is absent).
 
 ### Capacity sentinel (`...-sagemaker-sentinel`)
+
 
 Runs every minute (same EventBridge rule as the scaler). Describes every
 configured endpoint (`sagemaker:DescribeEndpoint`) and its scaling
 activities (`application-autoscaling:DescribeScalingActivities` on resource
-`endpoint/<name>/variant/trellis`), classifies each endpoint, elects the
-active one, and re-dispatches stranded tasks. Details below.
+`endpoint/<name>/variant/<variantName>`, per chain), classifies each
+endpoint, elects the active one, and re-dispatches stranded tasks — the
+whole pass runs independently per precision chain with per-chain SSM
+params, and stranded tasks are partitioned by their own `model` so neither
+chain rescues the other's tasks. Details below.
 
 Env: `TASKS_TABLE`, `WORK_BUCKET`, `SAGEMAKER_ENDPOINTS`,
-`ACTIVE_ENDPOINT_PARAM`, `LAST_FLIP_PARAM`, `FLIP_COOLDOWN_SECONDS` (300).
+`ACTIVE_ENDPOINT_PARAM`, `LAST_FLIP_PARAM`, `SAGEMAKER_ENDPOINTS_PIXAL3D`,
+`ACTIVE_ENDPOINT_PARAM_PIXAL3D`, `LAST_FLIP_PARAM_PIXAL3D`,
+`FLIP_COOLDOWN_SECONDS` (300, shared by both chains).
 
 ## EventBridge
 
@@ -109,6 +129,11 @@ the region's per-type endpoints). The permission lives in the Lambda's
 region (us-east-1); the source topic ARN is regional — SNS cross-region
 Lambda delivery supports this.
 
+When the v2 chain is deployed, a second pair per region covers its
+`-pixal3d`-suffixed topics (`AllowSNSSuccessPixal3dInvoke-<region>` /
+`AllowSNSErrorPixal3dInvoke-<region>`); the set is empty when
+`endpoints_pixal3d` is empty.
+
 ## Election SSM parameters
 
 - `/generate/${env}/sagemaker/active_endpoint` — the NAME of the endpoint
@@ -123,6 +148,9 @@ Lambda delivery supports this.
   last flip; drives the cooldown. Initial value is epoch so the first flip is
   never blocked. Same `ignore_changes`. One global cooldown covers the whole
   chain (prevents chain flapping, not just per-endpoint oscillation).
+- `/generate/${env}/sagemaker/pixal3d/active_endpoint` and
+  `.../pixal3d/last_flip` — the v2 (Pixal3D) chain's pair, identical
+  semantics; created only when `endpoints_pixal3d` is non-empty.
 
 ## Endpoint classification
 

@@ -50,6 +50,36 @@ variable "instance_types" {
   }
 }
 
+variable "model_token" {
+  description = "Engine dimension: 'trellis' (default; Precision v1 — every name/SSM read/variant stays byte-identical) or 'pixal3d' (Precision v2 — '-pixal3d' suffix on Model/EndpointConfig/Endpoint/SNS/policy/alarm names, variant_name 'pixal3d', pixal container env, pixal weights SSM param)."
+  type        = string
+  default     = "trellis"
+
+  validation {
+    condition     = contains(["trellis", "pixal3d"], var.model_token)
+    error_message = "model_token must be 'trellis' or 'pixal3d'."
+  }
+}
+
+variable "container_env_extra" {
+  description = "Extra container environment merged into the Model environment per instance type. Wins over the derived base env and the per-type low-VRAM key (escape hatch; per-type values should not be overridden with a constant)."
+  type        = map(string)
+  default     = {}
+}
+
+variable "weights_ssm_param" {
+  description = "SSM parameter holding this model's weights tar URI. Default: /trellis2image/$${env}/weights/s3_uri (the v1 artifact). The v2 instance passes .../weights/pixal3d_s3_uri."
+  type        = string
+  default     = null
+}
+
+variable "create_buckets" {
+  description = "Own (create) the input/output/weights buckets from var.bucket_names. The v1 instance creates them; a v2 instance sets this false and passes the SAME bucket_names — input/output are shared as-is, and the v2 weights tar lands under the pixal-weights/ prefix of the same weights bucket."
+  type        = bool
+  default     = true
+}
+
+
 variable "max_capacity" {
   description = "Autoscaling max instance count per endpoint variant (min is 0; one target per instance type). The instance-type quota is account-wide per region per type: every env's maxima must sum within that region's endpoint-usage quota (g5.2xlarge L-9614C779, g6e.2xlarge L-F8D7F460, g7e.2xlarge L-5AA715AC)."
   type        = number

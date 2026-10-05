@@ -150,6 +150,7 @@ export async function handler(event: APIGatewayProxyEventV2): Promise<APIGateway
     artifact_prefix: parent?.artifact_prefix,
     idempotency_key: request.idempotency_key,
     source: 'api',
+    model: request.model,
     created_at: now.toISOString(),
     updated_at: now.toISOString(),
     ttl: ttlFromNow(now),

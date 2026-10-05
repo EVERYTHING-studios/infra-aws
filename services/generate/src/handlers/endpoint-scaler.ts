@@ -2,7 +2,7 @@ import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import { DynamoDBDocumentClient, QueryCommand } from '@aws-sdk/lib-dynamodb';
 import { CloudWatchClient, PutMetricDataCommand } from '@aws-sdk/client-cloudwatch';
 import { requireEnv } from '../lib/env.js';
-import { parseEndpointConfig } from '../lib/sagemaker.js';
+import { parseEndpointConfig, parseOptionalEndpointConfig } from '../lib/sagemaker.js';
 
 const docClient = DynamoDBDocumentClient.from(new DynamoDBClient({}), {
   marshallOptions: { removeUndefinedValues: true },
@@ -13,8 +13,10 @@ const docClient = DynamoDBDocumentClient.from(new DynamoDBClient({}), {
  * IN_PROGRESS and QUEUED tasks that hold a SageMaker task token, attributes
  * each to its `sagemaker_region` (records pre-dating the multi-region
  * refactor attribute to us-east-1), and publishes an `EndpointIdle`
- * datapoint for EVERY configured endpoint: 0 if that endpoint's region has
- * active tasks, 1 if not. QUEUED counts as busy: a request waiting in
+ * datapoint for EVERY configured endpoint of BOTH precision chains (the v1
+ * chain from SAGEMAKER_ENDPOINTS, the v2 Pixal3D chain from
+ * SAGEMAKER_ENDPOINTS_PIXAL3D when configured): 0 if that endpoint's region
+ * has active tasks, 1 if not. QUEUED counts as busy: a request waiting in
  * SageMaker's async queue is still holding capacity intent, and marking its
  * region idle would let scale-to-zero kill the instance it is waiting on.
  * Busy attribution stays region-keyed BY DESIGN: with multiple
@@ -28,7 +30,10 @@ const docClient = DynamoDBDocumentClient.from(new DynamoDBClient({}), {
  */
 export async function handler(): Promise<{ idle: number }> {
   const tableName = requireEnv('TASKS_TABLE');
-  const regions = parseEndpointConfig(requireEnv('SAGEMAKER_ENDPOINTS'));
+  const endpoints = [
+    ...parseEndpointConfig(requireEnv('SAGEMAKER_ENDPOINTS')),
+    ...parseOptionalEndpointConfig(process.env.SAGEMAKER_ENDPOINTS_PIXAL3D),
+  ];
 
   try {
     const results = await Promise.all(
@@ -53,7 +58,7 @@ export async function handler(): Promise<{ idle: number }> {
     );
 
     await Promise.all(
-      regions.map(async (conf) => {
+      endpoints.map(async (conf) => {
         const cloudwatch = new CloudWatchClient({ region: conf.region });
         await cloudwatch.send(
           new PutMetricDataCommand({
@@ -72,14 +77,14 @@ export async function handler(): Promise<{ idle: number }> {
     );
 
     // Aggregate for the return value: idle only when no region has tasks.
-    const idle = regions.some((conf) => busyRegions.has(conf.region)) ? 0 : 1;
+    const idle = endpoints.some((conf) => busyRegions.has(conf.region)) ? 0 : 1;
     return { idle };
   } catch (err) {
     console.error('Endpoint scaler check failed', err);
     // Safe default: publish 0 (busy) for every region so no alarm fires on errors.
     try {
       await Promise.all(
-        regions.map(async (conf) => {
+        endpoints.map(async (conf) => {
           const cloudwatch = new CloudWatchClient({ region: conf.region });
           await cloudwatch.send(
             new PutMetricDataCommand({

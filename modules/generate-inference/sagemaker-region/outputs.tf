@@ -6,10 +6,10 @@ output "this" {
   value = {
     (var.region) = {
       region             = var.region
-      input_bucket       = aws_s3_bucket.sagemaker_input.bucket
-      input_bucket_arn   = aws_s3_bucket.sagemaker_input.arn
-      output_bucket_arn  = aws_s3_bucket.sagemaker_output.arn
-      weights_bucket_arn = aws_s3_bucket.sagemaker_weights.arn
+      input_bucket       = var.bucket_names.input
+      input_bucket_arn   = local.bucket_arns.input
+      output_bucket_arn  = local.bucket_arns.output
+      weights_bucket_arn = local.bucket_arns.weights
       success_topic_arn  = aws_sns_topic.success.arn
       error_topic_arn    = aws_sns_topic.error.arn
       endpoints = {

@@ -41,6 +41,16 @@ const ENDPOINTS = [
   { region: 'us-east-2', instanceType: 'g5', endpointName: 'svc-sagemaker-g5-useast2', inputBucket: 'in-g5-use2' },
 ];
 
+const PX_ENDPOINTS = [
+  {
+    region: 'us-east-1',
+    instanceType: 'g5',
+    endpointName: 'svc-sagemaker-pixal3d-g5',
+    inputBucket: 'in-g5-use1',
+    variantName: 'pixal3d',
+  },
+];
+
 const task: TaskRecord = {
   task_id: '01JDISPATCH',
   type: 'text-to-3d-preview',
@@ -64,6 +74,8 @@ beforeEach(() => {
   ssmSend.mockReset().mockResolvedValue({ Parameter: { Value: 'svc-sagemaker-g5-useast2' } });
   process.env.ACTIVE_ENDPOINT_PARAM = '/generate/staging/sagemaker/active_endpoint';
   process.env.SAGEMAKER_ENDPOINTS = JSON.stringify(ENDPOINTS);
+  delete process.env.ACTIVE_ENDPOINT_PARAM_PIXAL3D;
+  delete process.env.SAGEMAKER_ENDPOINTS_PIXAL3D;
 });
 
 describe('inference-sagemaker-dispatch', () => {
@@ -100,5 +112,48 @@ describe('inference-sagemaker-dispatch', () => {
     expect(dispatchToRegion).not.toHaveBeenCalled();
     expect(updateTask).not.toHaveBeenCalled();
     expect(enqueueWebhook).not.toHaveBeenCalled();
+  });
+
+  it('dispatches a precision-v2 task on the pixal3d chain (event model wins)', async () => {
+    process.env.SAGEMAKER_ENDPOINTS_PIXAL3D = JSON.stringify(PX_ENDPOINTS);
+    process.env.ACTIVE_ENDPOINT_PARAM_PIXAL3D = '/generate/staging/sagemaker/pixal3d/active_endpoint';
+    ssmSend.mockResolvedValue({ Parameter: { Value: 'svc-sagemaker-pixal3d-g5' } });
+
+    const result = await handler({
+      task_id: '01JDISPATCH',
+      postprocess: 'lite',
+      task_token: 'tok-2',
+      model: 'precision-v2',
+    });
+
+    expect(result).toEqual({ dispatched: true });
+    const [dispatchedTask, conf] = dispatchToRegion.mock.calls[0] as [TaskRecord, SageMakerLib.EndpointConfig];
+    expect(dispatchedTask.task_id).toBe('01JDISPATCH');
+    expect(conf.endpointName).toBe('svc-sagemaker-pixal3d-g5');
+    expect(conf.variantName).toBe('pixal3d');
+    // The SSM read targets the v2 chain's own parameter.
+    expect(ssmSend).toHaveBeenCalledWith(
+      expect.objectContaining({ input: { Name: '/generate/staging/sagemaker/pixal3d/active_endpoint' } }),
+    );
+  });
+
+  it('falls back to the task record model when the event omits it', async () => {
+    process.env.SAGEMAKER_ENDPOINTS_PIXAL3D = JSON.stringify(PX_ENDPOINTS);
+    process.env.ACTIVE_ENDPOINT_PARAM_PIXAL3D = '/generate/staging/sagemaker/pixal3d/active_endpoint';
+    ssmSend.mockResolvedValue({ Parameter: { Value: 'svc-sagemaker-pixal3d-g5' } });
+    getTask.mockResolvedValue({ ...task, model: 'precision-v2' });
+
+    await handler({ task_id: '01JDISPATCH', postprocess: 'lite', task_token: 'tok-3' });
+
+    const conf = dispatchToRegion.mock.calls[0]?.[1] as SageMakerLib.EndpointConfig;
+    expect(conf.endpointName).toBe('svc-sagemaker-pixal3d-g5');
+  });
+
+  it('throws when precision-v2 is requested but no pixal3d chain is configured', async () => {
+    await expect(
+      handler({ task_id: '01JDISPATCH', postprocess: 'lite', task_token: 'tok-4', model: 'precision-v2' }),
+    ).rejects.toThrow(/no Pixal3D chain is configured/);
+    expect(dispatchToRegion).not.toHaveBeenCalled();
+    expect(updateTask).not.toHaveBeenCalled();
   });
 });

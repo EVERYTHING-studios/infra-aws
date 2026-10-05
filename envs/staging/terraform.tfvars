@@ -54,3 +54,23 @@ sagemaker_max_capacity = 1
 # (already exist), re-run replicate_artifacts.sh with
 # REPLICATE_REGIONS="us-west-2", then full apply.
 sagemaker_candidate_regions = ["us-east-1", "us-east-2"]
+
+# Precision v2 (Pixal3D) rollout (staging only): deploy the pixal3d chain
+# alongside the v1 TRELLIS chain. API `model: "precision-v2"` routes tasks to
+# it; default (absent) stays precision-v1. The v2 chain shares the v1 image
+# (ECR) and buckets; its weights tar lives under pixal-weights/ and its SSM
+# URI param is /trellis2image/staging/weights/pixal3d_s3_uri — BOTH must
+# exist per candidate region before apply (package_weights.sh /
+# replicate_artifacts.sh with MODEL=pixal3d). Chain: g6e ONLY — the g5 tier
+# was dropped 2026-10-05: v2's ~16 GB CPU-resident low-VRAM footprint plus
+# per-stage swap transients walked a system-RAM cliff on g5.2xlarge (32 GB)
+# stage-by-stage (4 staging attempts SIGKILLed at progressively later big
+# swaps; -3.6 GB of DINOv3 dedup bought exactly one stage). g6e runs the
+# standard 1536 cascade with all weights on GPU (PIXAL3D_LOW_VRAM=0),
+# which removes the entire cliff class. A g5 tier needs swap-order
+# restructuring + max_num_tokens capping + container memory instrumentation
+# first (follow-up). g7e omitted for the same Blackwell-capacity reason as
+# v1. Production tfvars deliberately does NOT set this (default false =
+# exact pre-v2 policy JSON, no v2 resources).
+pixal3d_enabled        = true
+pixal3d_instance_types = ["ml.g6e.2xlarge"]

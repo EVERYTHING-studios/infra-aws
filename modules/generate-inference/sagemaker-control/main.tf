@@ -37,14 +37,38 @@ locals {
   # Array order = the sentinel's election priority (parent's type-major
   # chain order). A JSON array, not an object — object keys serialize in
   # lexicographic order, which would destroy the chain ordering.
+  # variantName keys the autoscaling ResourceId per endpoint.
   endpoints_json = jsonencode([
     for e in var.endpoints : {
       region       = e.region
       instanceType = e.token
       endpointName = e.endpoint_name
       inputBucket  = e.input_bucket
+      variantName  = coalesce(e.variant_name, "trellis")
     }
   ])
+
+  # The Precision v2 (Pixal3D) chain's env, same shape. Always emitted (an
+  # empty array when the chain is absent) — the handlers treat [] as
+  # "chain not deployed".
+  endpoints_pixal3d_json = jsonencode([
+    for e in var.endpoints_pixal3d : {
+      region       = e.region
+      instanceType = e.token
+      endpointName = e.endpoint_name
+      inputBucket  = e.input_bucket
+      variantName  = "pixal3d"
+    }
+  ])
+
+  # Both chains' endpoints — the dispatcher/sentinel policies cover whichever
+  # chain a task's model routes it to.
+  all_endpoints = concat(var.endpoints, var.endpoints_pixal3d)
+  # Static gate (var.pixal3d_enabled), NOT length(var.endpoints_pixal3d):
+  # the endpoints list is apply-time unknown while the v2 regional stacks
+  # are being created, and count/for_each gates must be known at plan time.
+  # var.pixal3d_enabled => the list is non-empty by construction.
+  pixal_chain = var.pixal3d_enabled
 
   # Region-shared view of the endpoint list (buckets + topic ARNs are
   # identical for every endpoint in a region). Grouped with the ellipsis
@@ -52,6 +76,9 @@ locals {
   # multiple types per region and HCL for-expressions reject duplicate keys;
   # lookups take [0] — same-region entries share these fields.
   regions_by_name = { for e in var.endpoints : e.region => e... }
+
+  # Same region-shared view of the v2 chain (its topics differ: -pixal3d).
+  regions_by_name_pixal3d = { for e in var.endpoints_pixal3d : e.region => e... }
 
   # Webhook queues are owned by generate-pipeline; constructing their
   # URLs/ARNs here (queue names are fixed by that module) breaks the
@@ -95,6 +122,37 @@ resource "aws_ssm_parameter" "last_flip" {
   }
 }
 
+# The Precision v2 (Pixal3D) chain's election pair — identical semantics
+# under the pixal3d/ namespace. Created only when the v2 chain is deployed.
+resource "aws_ssm_parameter" "active_endpoint_pixal3d" {
+  count = local.pixal_chain ? 1 : 0
+
+  name        = "/generate/${var.env}/sagemaker/pixal3d/active_endpoint"
+  description = "Precision v2 (Pixal3D) SageMaker endpoint name currently receiving dispatches; flipped at runtime by the capacity-sentinel Lambda."
+  type        = "String"
+  # Initial value: the v2 chain head. The sentinel overwrites this at
+  # runtime — value changes are deliberately ignored below.
+  value = var.endpoints_pixal3d[0].endpoint_name
+
+  lifecycle {
+    ignore_changes = [value]
+  }
+}
+
+resource "aws_ssm_parameter" "last_flip_pixal3d" {
+  count = local.pixal_chain ? 1 : 0
+
+  name        = "/generate/${var.env}/sagemaker/pixal3d/last_flip"
+  description = "ISO timestamp of the sentinel's last pixal3d active_endpoint flip; drives the flip cooldown."
+  type        = "String"
+  # Epoch so the first flip is never blocked by the cooldown.
+  value = "1970-01-01T00:00:00.000Z"
+
+  lifecycle {
+    ignore_changes = [value]
+  }
+}
+
 # ------------------------------------------------------------------
 # Dispatcher Lambda: invoked by the state machine's
 # lambda:invoke.waitForTaskToken Inference state. Reads active_endpoint from
@@ -111,17 +169,20 @@ data "aws_iam_policy_document" "dispatcher" {
 
   statement {
     actions   = ["s3:PutObject"]
-    resources = toset([for e in var.endpoints : "${e.input_bucket_arn}/*"])
+    resources = toset([for e in local.all_endpoints : "${e.input_bucket_arn}/*"])
   }
 
   statement {
     actions   = ["sagemaker:InvokeEndpointAsync"]
-    resources = [for e in var.endpoints : e.endpoint_arn]
+    resources = [for e in local.all_endpoints : e.endpoint_arn]
   }
 
   statement {
-    actions   = ["ssm:GetParameter"]
-    resources = [aws_ssm_parameter.active_endpoint.arn, aws_ssm_parameter.last_flip.arn]
+    actions = ["ssm:GetParameter"]
+    resources = compact([
+      aws_ssm_parameter.active_endpoint.arn,
+      try(aws_ssm_parameter.active_endpoint_pixal3d[0].arn, null),
+    ])
   }
 
   statement {
@@ -148,12 +209,14 @@ module "dispatcher" {
   attach_policy = true
 
   environment = {
-    TASKS_TABLE                = var.tasks_table_name
-    WORK_BUCKET                = var.work_bucket_name
-    SAGEMAKER_ENDPOINTS        = local.endpoints_json
-    ACTIVE_ENDPOINT_PARAM      = aws_ssm_parameter.active_endpoint.name
-    WEBHOOK_QUEUE_URL          = local.webhook_queue_url
-    CUSTOMER_WEBHOOK_QUEUE_URL = local.customer_webhook_queue_url
+    TASKS_TABLE                   = var.tasks_table_name
+    WORK_BUCKET                   = var.work_bucket_name
+    SAGEMAKER_ENDPOINTS           = local.endpoints_json
+    ACTIVE_ENDPOINT_PARAM         = aws_ssm_parameter.active_endpoint.name
+    SAGEMAKER_ENDPOINTS_PIXAL3D   = local.endpoints_pixal3d_json
+    ACTIVE_ENDPOINT_PARAM_PIXAL3D = try(aws_ssm_parameter.active_endpoint_pixal3d[0].name, "")
+    WEBHOOK_QUEUE_URL             = local.webhook_queue_url
+    CUSTOMER_WEBHOOK_QUEUE_URL    = local.customer_webhook_queue_url
   }
 }
 
@@ -235,8 +298,9 @@ module "endpoint_scaler" {
   attach_policy = true
 
   environment = {
-    TASKS_TABLE         = var.tasks_table_name
-    SAGEMAKER_ENDPOINTS = local.endpoints_json
+    TASKS_TABLE                 = var.tasks_table_name
+    SAGEMAKER_ENDPOINTS         = local.endpoints_json
+    SAGEMAKER_ENDPOINTS_PIXAL3D = local.endpoints_pixal3d_json
   }
 }
 
@@ -250,7 +314,7 @@ module "endpoint_scaler" {
 data "aws_iam_policy_document" "sentinel" {
   statement {
     actions   = ["sagemaker:DescribeEndpoint"]
-    resources = [for e in var.endpoints : e.endpoint_arn]
+    resources = [for e in local.all_endpoints : e.endpoint_arn]
   }
 
   statement {
@@ -260,8 +324,13 @@ data "aws_iam_policy_document" "sentinel" {
   }
 
   statement {
-    actions   = ["ssm:GetParameter", "ssm:PutParameter"]
-    resources = [aws_ssm_parameter.active_endpoint.arn, aws_ssm_parameter.last_flip.arn]
+    actions = ["ssm:GetParameter", "ssm:PutParameter"]
+    resources = compact([
+      aws_ssm_parameter.active_endpoint.arn,
+      aws_ssm_parameter.last_flip.arn,
+      try(aws_ssm_parameter.active_endpoint_pixal3d[0].arn, null),
+      try(aws_ssm_parameter.last_flip_pixal3d[0].arn, null),
+    ])
   }
 
   statement {
@@ -282,12 +351,12 @@ data "aws_iam_policy_document" "sentinel" {
 
   statement {
     actions   = ["s3:PutObject"]
-    resources = toset([for e in var.endpoints : "${e.input_bucket_arn}/*"])
+    resources = toset([for e in local.all_endpoints : "${e.input_bucket_arn}/*"])
   }
 
   statement {
     actions   = ["sagemaker:InvokeEndpointAsync"]
-    resources = [for e in var.endpoints : e.endpoint_arn]
+    resources = [for e in local.all_endpoints : e.endpoint_arn]
   }
 
   # QUEUED -> IN_PROGRESS promotion enqueues task.updated webhooks (queues
@@ -309,14 +378,17 @@ module "capacity_sentinel" {
   attach_policy = true
 
   environment = {
-    TASKS_TABLE                = var.tasks_table_name
-    WORK_BUCKET                = var.work_bucket_name
-    SAGEMAKER_ENDPOINTS        = local.endpoints_json
-    ACTIVE_ENDPOINT_PARAM      = aws_ssm_parameter.active_endpoint.name
-    LAST_FLIP_PARAM            = aws_ssm_parameter.last_flip.name
-    FLIP_COOLDOWN_SECONDS      = "300"
-    WEBHOOK_QUEUE_URL          = local.webhook_queue_url
-    CUSTOMER_WEBHOOK_QUEUE_URL = local.customer_webhook_queue_url
+    TASKS_TABLE                   = var.tasks_table_name
+    WORK_BUCKET                   = var.work_bucket_name
+    SAGEMAKER_ENDPOINTS           = local.endpoints_json
+    ACTIVE_ENDPOINT_PARAM         = aws_ssm_parameter.active_endpoint.name
+    LAST_FLIP_PARAM               = aws_ssm_parameter.last_flip.name
+    SAGEMAKER_ENDPOINTS_PIXAL3D   = local.endpoints_pixal3d_json
+    ACTIVE_ENDPOINT_PARAM_PIXAL3D = try(aws_ssm_parameter.active_endpoint_pixal3d[0].name, "")
+    LAST_FLIP_PARAM_PIXAL3D       = try(aws_ssm_parameter.last_flip_pixal3d[0].name, "")
+    FLIP_COOLDOWN_SECONDS         = "300"
+    WEBHOOK_QUEUE_URL             = local.webhook_queue_url
+    CUSTOMER_WEBHOOK_QUEUE_URL    = local.customer_webhook_queue_url
   }
 }
 
@@ -388,6 +460,28 @@ resource "aws_lambda_permission" "sns_error" {
   action        = "lambda:InvokeFunction"
   principal     = "sns.amazonaws.com"
   source_arn    = local.regions_by_name[each.key][0].error_topic_arn
+  function_name = module.callback.function_name
+}
+
+# The Precision v2 chain's topics, same pattern. The permission set is
+# empty when the v2 chain is absent (for_each keys stay static).
+resource "aws_lambda_permission" "sns_success_pixal3d" {
+  for_each = local.pixal_chain ? toset(var.region_names) : toset([])
+
+  statement_id  = "AllowSNSSuccessPixal3dInvoke-${each.key}"
+  action        = "lambda:InvokeFunction"
+  principal     = "sns.amazonaws.com"
+  source_arn    = local.regions_by_name_pixal3d[each.key][0].success_topic_arn
+  function_name = module.callback.function_name
+}
+
+resource "aws_lambda_permission" "sns_error_pixal3d" {
+  for_each = local.pixal_chain ? toset(var.region_names) : toset([])
+
+  statement_id  = "AllowSNSErrorPixal3dInvoke-${each.key}"
+  action        = "lambda:InvokeFunction"
+  principal     = "sns.amazonaws.com"
+  source_arn    = local.regions_by_name_pixal3d[each.key][0].error_topic_arn
   function_name = module.callback.function_name
 }
 

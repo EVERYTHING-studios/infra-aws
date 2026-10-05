@@ -27,6 +27,10 @@ export type TaskStatus = (typeof TASK_STATUSES)[number];
 
 export const TERMINAL_STATUSES: readonly TaskStatus[] = ['SUCCEEDED', 'FAILED', 'CANCELED'];
 
+/** Inference engines selectable per task. Absent `model` = precision-v1. */
+export const PRECISION_MODELS = ['precision-v1', 'precision-v2'] as const;
+export type PrecisionModel = (typeof PRECISION_MODELS)[number];
+
 export interface TaskInput {
   prompt?: string;
   negative_prompt?: string;
@@ -59,6 +63,8 @@ export interface CreateTaskRequest {
   options?: TaskOptions;
   output?: TaskOutputHints;
   idempotency_key?: string;
+  /** Inference engine; absent = precision-v1. */
+  model?: PrecisionModel;
 }
 
 /** POST /v1/jobs body — customer API. No output hints: the destination is synthesized server-side. */
@@ -67,6 +73,8 @@ export interface CreateJobRequest {
   input: TaskInput;
   options?: TaskOptions;
   idempotency_key?: string;
+  /** Inference engine; absent = precision-v1. */
+  model?: PrecisionModel;
 }
 
 export interface ModelUrls {
@@ -103,6 +111,8 @@ export interface TaskRecord {
   sagemaker_task_token?: string;
   sagemaker_region?: string;
   inference_backend?: string;
+  /** Inference engine chain for this task; absent = precision-v1 (legacy records). */
+  model?: PrecisionModel;
   idempotency_key?: string;
   /** Origin of the task; absent = 'web-app' (legacy in-flight records). */
   source?: 'web-app' | 'api';

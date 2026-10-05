@@ -130,13 +130,16 @@ vi.mock('@aws-sdk/lib-dynamodb', () => ({
           const values = input.ExpressionAttributeValues ?? {};
           const status = values[':status'] as string | undefined;
           const region = values[':region'] as string | undefined;
+          const model = values[':model'] as 'precision-v1' | 'precision-v2' | undefined;
           // Emulate the key condition + filter: status match, token present,
-          // region match when the promotion query supplies one.
+          // region match when the promotion query supplies one, and model
+          // match per the chain's filter (absent model = precision-v1).
           let items = h.tasks.filter(
             (t) =>
               `STATUS#${t.status}` === status &&
               t.sagemaker_task_token !== undefined &&
-              (region === undefined || t.sagemaker_region === region),
+              (region === undefined || t.sagemaker_region === region) &&
+              (model === undefined || (t.model ?? 'precision-v1') === model),
           );
           items = items.slice(0, input.Limit ?? 100);
           return { Items: items };
@@ -294,6 +297,26 @@ describe('chain election', () => {
 
     expect(result.flipped).toBe(false);
     expect(result.active_endpoint).toBe('svc-sagemaker-g5');
+  });
+
+  it('heals a stale stored election when the stored endpoint left the chain (chain shrink)', async () => {
+    // tfvars dropped the g5 tier: the chain is g6e-only, but the stored
+    // election still names the deleted g5 endpoint. The dispatcher
+    // validates the stored value against the configured list and would
+    // dead-end (throw) on it, so the sentinel must persist the resolved
+    // head even though no capacity flip occurred.
+    process.env.SAGEMAKER_ENDPOINTS = JSON.stringify([
+      { region: 'us-east-1', instanceType: 'g6e', endpointName: 'svc-sagemaker-g6e', inputBucket: 'in-g6e-use1' },
+    ]);
+    h.factsByEndpoint['svc-sagemaker-g6e'] = { status: 'InService', current: 0, desired: 0 };
+    h.ssmValues[ACTIVE_PARAM] = 'svc-sagemaker-g5'; // dropped from the chain
+
+    const result = await handler();
+
+    expect(result.flipped).toBe(false);
+    expect(result.active_endpoint).toBe('svc-sagemaker-g6e');
+    // The stale value is healed in SSM, not just in memory.
+    expect(h.ssmValues[ACTIVE_PARAM]).toBe('svc-sagemaker-g6e');
   });
 });
 
@@ -563,5 +586,119 @@ describe('queued-task rescue + promotion', () => {
     const stamped = Date.parse(values[':capacity'] as string);
     expect(stamped).toBeGreaterThanOrEqual(before);
     expect(stamped).toBeLessThanOrEqual(Date.now());
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Dual-chain (Precision v1 + v2): the same election/rescue/promotion pass
+// runs independently per chain with its own SSM params; tasks are
+// partitioned by their own `model` so neither chain touches the other's
+// tasks or endpoints.
+// ---------------------------------------------------------------------------
+const PIXAL_ACTIVE_PARAM = '/generate/staging/sagemaker/pixal3d/active_endpoint';
+const PIXAL_LAST_FLIP_PARAM = '/generate/staging/sagemaker/pixal3d/last_flip';
+const PIXAL_CHAIN = [
+  { region: 'us-east-1', instanceType: 'g5', endpointName: 'svc-sagemaker-pixal3d-g5', inputBucket: 'in-g5-use1', variantName: 'pixal3d' },
+  { region: 'us-east-2', instanceType: 'g5', endpointName: 'svc-sagemaker-pixal3d-g5-useast2', inputBucket: 'in-g5-use2', variantName: 'pixal3d' },
+];
+
+describe('dual-chain election (v1 + v2)', () => {
+  beforeEach(() => {
+    process.env.SAGEMAKER_ENDPOINTS = JSON.stringify(TWO_REGION_CHAIN);
+    process.env.SAGEMAKER_ENDPOINTS_PIXAL3D = JSON.stringify(PIXAL_CHAIN);
+    process.env.ACTIVE_ENDPOINT_PARAM_PIXAL3D = PIXAL_ACTIVE_PARAM;
+    process.env.LAST_FLIP_PARAM_PIXAL3D = PIXAL_LAST_FLIP_PARAM;
+    h.factsByEndpoint = {};
+    h.tasks = [];
+    h.updates = [];
+    h.webhooks = [];
+    h.dispatches = [];
+    h.failUpdateForPks.clear();
+    delete h.ssmValues[PIXAL_ACTIVE_PARAM];
+    delete h.ssmValues[PIXAL_LAST_FLIP_PARAM];
+  });
+
+  it('elects each chain independently: a v1 drought does not drag the v2 chain, and flips land in per-chain SSM params', async () => {
+    // v1 chain: every endpoint dry/dead.
+    for (const name of ['svc-sagemaker-g5', 'svc-sagemaker-g5-useast2', 'svc-sagemaker-g6e', 'svc-sagemaker-g6e-useast2', 'svc-sagemaker-g7e', 'svc-sagemaker-g7e-useast2']) {
+      h.factsByEndpoint[name] = { status: 'Failed', current: 0, desired: 0 };
+    }
+    // v2 chain: useast2 drought, us-east-1 healthy -> v2 flips to use1.
+    h.factsByEndpoint['svc-sagemaker-pixal3d-g5-useast2'] = {
+      status: 'InService', current: 0, desired: 1,
+      activityCode: 'InProgress', activityStartMinAgo: 20,
+    };
+    h.factsByEndpoint['svc-sagemaker-pixal3d-g5'] = { status: 'InService', current: 1, desired: 1 };
+    h.ssmValues[ACTIVE_PARAM] = 'svc-sagemaker-g5';
+    h.ssmValues[PIXAL_ACTIVE_PARAM] = 'svc-sagemaker-pixal3d-g5-useast2';
+
+    const result = await handler();
+
+    // v1 has no healthy candidate: stays, records nothing new.
+    expect(result.active_endpoint).toBe('svc-sagemaker-g5');
+    expect(result.flipped).toBe(false);
+    expect(h.ssmValues[ACTIVE_PARAM]).toBe('svc-sagemaker-g5');
+    // v2 flipped to its healthy us-east-1 endpoint, in its OWN param.
+    expect(result.pixal3d?.flipped).toBe(true);
+    expect(result.pixal3d?.active_endpoint).toBe('svc-sagemaker-pixal3d-g5');
+    expect(h.ssmValues[PIXAL_ACTIVE_PARAM]).toBe('svc-sagemaker-pixal3d-g5');
+    // v2 classes are reported separately, keyed by v2 endpoint names.
+    expect(result.pixal3d?.classes).toEqual({
+      'svc-sagemaker-pixal3d-g5': 'HEALTHY',
+      'svc-sagemaker-pixal3d-g5-useast2': 'DROUGHT',
+    });
+  });
+
+  it('rescue is chain-scoped: a stranded v2 task goes to the v2 active endpoint, a stranded v1 task to the v1 one', async () => {
+    // Both chains healthy+live in us-east-1; both tasks stranded in us-east-2.
+    h.factsByEndpoint['svc-sagemaker-g5'] = { status: 'InService', current: 1, desired: 1 };
+    h.factsByEndpoint['svc-sagemaker-pixal3d-g5'] = { status: 'InService', current: 1, desired: 1 };
+    for (const name of ['svc-sagemaker-g5-useast2', 'svc-sagemaker-g6e', 'svc-sagemaker-g6e-useast2', 'svc-sagemaker-g7e', 'svc-sagemaker-g7e-useast2', 'svc-sagemaker-pixal3d-g5-useast2']) {
+      h.factsByEndpoint[name] = { status: 'Failed', current: 0, desired: 0 };
+    }
+    h.ssmValues[ACTIVE_PARAM] = 'svc-sagemaker-g5';
+    h.ssmValues[PIXAL_ACTIVE_PARAM] = 'svc-sagemaker-pixal3d-g5';
+    h.tasks = [
+      mkTask({ task_id: '01JV1TASK', sagemaker_region: 'us-east-2' }),
+      mkTask({ task_id: '01JV2TASK', model: 'precision-v2', sagemaker_region: 'us-east-2' }),
+    ];
+
+    const result = await handler();
+
+    expect(result.rescued).toBe(1);
+    expect(result.pixal3d?.rescued).toBe(1);
+    expect(h.dispatches).toEqual([
+      { task_id: '01JV1TASK', endpointName: 'svc-sagemaker-g5', region: 'us-east-1' },
+      { task_id: '01JV2TASK', endpointName: 'svc-sagemaker-pixal3d-g5', region: 'us-east-1' },
+    ]);
+  });
+
+  it('promotion is chain-scoped: a live v2 instance must not promote a v1 QUEUED task in the same region', async () => {
+    // v2 has a live instance in us-east-1; v1 is idle at zero there.
+    h.factsByEndpoint['svc-sagemaker-g5'] = {
+      status: 'InService', current: 0, desired: 0,
+      activityCode: 'Successful', activityDescription: 'Setting desired instance count to 0.',
+      activityStartMinAgo: 5,
+    };
+    h.factsByEndpoint['svc-sagemaker-pixal3d-g5'] = { status: 'InService', current: 1, desired: 1 };
+    for (const name of ['svc-sagemaker-g5-useast2', 'svc-sagemaker-g6e', 'svc-sagemaker-g6e-useast2', 'svc-sagemaker-g7e', 'svc-sagemaker-g7e-useast2', 'svc-sagemaker-pixal3d-g5-useast2']) {
+      h.factsByEndpoint[name] = { status: 'Failed', current: 0, desired: 0 };
+    }
+    h.ssmValues[ACTIVE_PARAM] = 'svc-sagemaker-g5';
+    h.ssmValues[PIXAL_ACTIVE_PARAM] = 'svc-sagemaker-pixal3d-g5';
+    h.tasks = [
+      // v1 task queued in us-east-1: its own chain has no live instance.
+      mkTask({ task_id: '01JV1QUEUED', sagemaker_region: 'us-east-1' }),
+      // v2 task queued in us-east-1: its chain's instance is live.
+      mkTask({ task_id: '01JV2QUEUED', model: 'precision-v2', sagemaker_region: 'us-east-1' }),
+    ];
+
+    const result = await handler();
+
+    expect(result.promoted).toBe(0);
+    expect(result.pixal3d?.promoted).toBe(1);
+    expect(h.webhooks).toEqual([
+      expect.objectContaining({ task_id: '01JV2QUEUED', status: 'IN_PROGRESS' }),
+    ]);
   });
 });
