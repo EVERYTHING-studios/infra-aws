@@ -332,6 +332,18 @@ async function runChain(
     throw new Error('No active endpoint resolved (SAGEMAKER_ENDPOINTS is empty)');
   }
 
+  // Heal a stale stored election: when the stored value references an
+  // endpoint no longer in the configured chain (e.g. an instance type was
+  // dropped from tfvars), persist the resolved head. The dispatcher
+  // validates the stored value against the configured list and dead-ends
+  // (throws) on a stale name, and the flip logic below never fires for
+  // this case (the fallback target scan only looks EARLIER than the
+  // resolved head), so without this write the chain stays unroutable.
+  if (storedActive !== activeEndpoint) {
+    await ssm.send(new PutParameterCommand({ Name: activeParam, Value: activeEndpoint, Type: 'String', Overwrite: true }));
+    console.log(`Healed stale election ${activeParam}: "${storedActive}" -> "${activeEndpoint}" (stored endpoint left the chain)`);
+  }
+
   // Classify every chain endpoint, preserving configured order.
   // Latest successful scale-out start per endpoint — from the same
   // DescribeScalingActivities facts used for classification. Feeds the

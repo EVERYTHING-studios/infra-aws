@@ -298,6 +298,26 @@ describe('chain election', () => {
     expect(result.flipped).toBe(false);
     expect(result.active_endpoint).toBe('svc-sagemaker-g5');
   });
+
+  it('heals a stale stored election when the stored endpoint left the chain (chain shrink)', async () => {
+    // tfvars dropped the g5 tier: the chain is g6e-only, but the stored
+    // election still names the deleted g5 endpoint. The dispatcher
+    // validates the stored value against the configured list and would
+    // dead-end (throw) on it, so the sentinel must persist the resolved
+    // head even though no capacity flip occurred.
+    process.env.SAGEMAKER_ENDPOINTS = JSON.stringify([
+      { region: 'us-east-1', instanceType: 'g6e', endpointName: 'svc-sagemaker-g6e', inputBucket: 'in-g6e-use1' },
+    ]);
+    h.factsByEndpoint['svc-sagemaker-g6e'] = { status: 'InService', current: 0, desired: 0 };
+    h.ssmValues[ACTIVE_PARAM] = 'svc-sagemaker-g5'; // dropped from the chain
+
+    const result = await handler();
+
+    expect(result.flipped).toBe(false);
+    expect(result.active_endpoint).toBe('svc-sagemaker-g6e');
+    // The stale value is healed in SSM, not just in memory.
+    expect(h.ssmValues[ACTIVE_PARAM]).toBe('svc-sagemaker-g6e');
+  });
 });
 
 // ---------------------------------------------------------------------------
