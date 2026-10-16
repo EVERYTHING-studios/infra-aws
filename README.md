@@ -185,12 +185,19 @@ sentinel elects the active endpoint from live evidence in cold-price chain order
   dispatcher/callback/scaler Lambdas plus a capacity-sentinel Lambda, all in us-east-1. AWS
   exposes no capacity-availability API, so the sentinel (EventBridge `rate(1 minute)`)
   classifies every chain endpoint FAILED / DROUGHT / PROVISIONING / HEALTHY from
-  describe-endpoint + scaling-activity evidence and flips the `active_endpoint` SSM
+  describe-endpoint (status, instance counts, `FailureReason`) + scaling-activity evidence,
+  flips the `active_endpoint` SSM
   parameter (`/generate/{env}/sagemaker/active_endpoint`, value = the elected endpoint's
-  NAME) with a 300 s cooldown. The dispatcher reads it and stages input + invokes on the
-  elected endpoint; failback to a higher-priority chain entry happens only once that
-  endpoint is healthy-PROVEN; tasks stranded in an abandoned region are re-dispatched
-  automatically. See the module READMEs for the full election rules.
+  NAME) with a 300 s cooldown, and publishes each chain's capacity snapshot to
+  `/generate/{env}/sagemaker/capacity`. The dispatcher reads both: normally it stages input +
+  invokes on the elected endpoint, but while the snapshot says no pool of the chain is healthy
+  it **spreads** new tasks across every non-FAILED pool (deterministic per task id), so every
+  pool keeps asking AWS for capacity and whichever one is granted it drains immediately.
+  Placement, never duplication — one task is invoked at exactly one endpoint, and a queued
+  async request cannot be cancelled. Failback to a higher-priority chain entry happens only
+  once that endpoint is healthy-PROVEN; tasks stranded in an abandoned region are
+  re-dispatched automatically once their own pool has had the cold-start window. See the
+  module READMEs for the full election rules.
 - **SageMaker async inference** endpoints: S3 in/out, SNS success/error topics → callback
   Lambda → `SendTaskSuccess` (the state machine's inference state becomes `.waitForTaskToken`).
   The container returns GLB bytes directly from `/invocations`; SageMaker writes them to the

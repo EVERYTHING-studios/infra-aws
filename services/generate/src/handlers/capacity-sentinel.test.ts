@@ -20,10 +20,13 @@ const h = vi.hoisted(() => {
         activityCode?: string;
         activityDescription?: string;
         activityStartMinAgo?: number;
+        failureReason?: string;
       }
     >,
     // SSM parameter store (Gets read it; Puts write it)
     ssmValues: {} as Record<string, string | undefined>,
+    // Parameter names whose PutParameter must throw (best-effort write paths).
+    failPutForParams: new Set<string>(),
     // Task records served by gsi2 queries (rescue + promotion).
     tasks: [] as TaskRecord[],
     // Raw UpdateCommand inputs received by the doc client.
@@ -48,6 +51,7 @@ vi.mock('@aws-sdk/client-ssm', () => ({
   SSMClient: class {
     async send(cmd: { input: { Name?: string; Value?: string } }) {
       if ('Value' in cmd.input && cmd.input.Name) {
+        if (h.failPutForParams.has(cmd.input.Name)) throw new Error('ssm:PutParameter denied');
         h.ssmValues[cmd.input.Name] = cmd.input.Value;
         return {};
       }
@@ -68,6 +72,7 @@ vi.mock('@aws-sdk/client-sagemaker', () => ({
       const f = h.factsByEndpoint[cmd.input.EndpointName ?? ''];
       return {
         EndpointStatus: f?.status ?? 'InService',
+        FailureReason: f?.failureReason,
         ProductionVariants: [
           { CurrentInstanceCount: f?.current ?? 0, DesiredInstanceCount: f?.desired ?? 0 },
         ],
@@ -197,6 +202,44 @@ describe('classify', () => {
       .toEqual({ class: 'DROUGHT', proven: false });
   });
 
+  it('DROUGHT on explicit InsufficientInstanceCapacity evidence however young the attempt looks', () => {
+    // Observed on the 2026-10-15 us-east-2 shortage: DescribeEndpoint carries
+    // the provisioning failure while the endpoint status stays InService at
+    // zero instances, and the autoscaling activity is a fresh retry.
+    expect(classify({ status: 'InService', current: 0, desired: 1,
+      latestActivityStatusCode: 'InProgress', latestActivityDescription: 'Setting desired instance count to 1.',
+      latestActivityStart: ago(2),
+      failureReason: 'Unable to provision all the requested ML compute capacity due to InsufficientInstanceCapacity error. Please try again later.' }))
+      .toEqual({ class: 'DROUGHT', proven: false });
+  });
+
+  it('PROVISIONING while a zero-instance attempt is inside a typical 5-6 min cold start', () => {
+    expect(classify({ status: 'InService', current: 0, desired: 1,
+      latestActivityStatusCode: 'InProgress', latestActivityDescription: 'Setting desired instance count to 1.',
+      latestActivityStart: ago(5) })).toEqual({ class: 'PROVISIONING', proven: false });
+  });
+
+  it('ignores an unrelated FailureReason (not a capacity error)', () => {
+    expect(classify({ status: 'InService', current: 0, desired: 1,
+      latestActivityStatusCode: 'InProgress', latestActivityStart: ago(2),
+      failureReason: 'Model image pull failed' })).toEqual({ class: 'PROVISIONING', proven: false });
+  });
+
+  it('DROUGHT outranks an endpoint-config update once autoscaling has declared the scale-out unfulfilled', () => {
+    // The one non-failureReason case the DROUGHT-first ordering changes:
+    // status Updating is an orthogonal endpoint-config update, while the
+    // activity's Unfulfilled is hard no-capacity evidence.
+    expect(classify({ status: 'Updating', current: 0, desired: 1,
+      latestActivityStatusCode: 'Unfulfilled', latestActivityDescription: 'Setting desired instance count to 1.',
+      latestActivityStart: ago(30) })).toEqual({ class: 'DROUGHT', proven: false });
+  });
+
+  it('HEALTHY (not PROVISIONING) for a stale attempt at desired 0 — nobody is asking for capacity', () => {
+    expect(classify({ status: 'Updating', current: 0, desired: 0,
+      latestActivityStatusCode: 'InProgress', latestActivityStart: ago(20) }))
+      .toEqual({ class: 'HEALTHY', proven: false });
+  });
+
   it('HEALTHY (not proven) when idle at desired 0 after a scale-down', () => {
     expect(classify({ status: 'InService', current: 0, desired: 0,
       latestActivityStatusCode: 'Successful', latestActivityDescription: 'Setting desired instance count to 0.',
@@ -227,11 +270,13 @@ const CHAIN = [
 ];
 const ACTIVE_PARAM = '/generate/staging/sagemaker/active_endpoint';
 const LAST_FLIP_PARAM = '/generate/staging/sagemaker/last_flip';
+const CAPACITY_PARAM = '/generate/staging/sagemaker/capacity';
 
 beforeAll(() => {
   process.env.SAGEMAKER_ENDPOINTS = JSON.stringify(CHAIN);
   process.env.ACTIVE_ENDPOINT_PARAM = ACTIVE_PARAM;
   process.env.LAST_FLIP_PARAM = LAST_FLIP_PARAM;
+  process.env.CAPACITY_PARAM = CAPACITY_PARAM;
   process.env.TASKS_TABLE = 'tasks';
   process.env.FLIP_COOLDOWN_SECONDS = '0';
 });
@@ -317,6 +362,81 @@ describe('chain election', () => {
     expect(result.active_endpoint).toBe('svc-sagemaker-g6e');
     // The stale value is healed in SSM, not just in memory.
     expect(h.ssmValues[ACTIVE_PARAM]).toBe('svc-sagemaker-g6e');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Capacity snapshot publication: every run writes the chain's per-endpoint
+// classes + no_healthy for the dispatcher's spread decision. The write is
+// best-effort — a failure must never abort the election.
+// ---------------------------------------------------------------------------
+describe('capacity snapshot publication', () => {
+  it('publishes per-endpoint classes with no_healthy=false while a pool can serve', async () => {
+    process.env.SAGEMAKER_ENDPOINTS = JSON.stringify(CHAIN);
+    h.factsByEndpoint['svc-sagemaker-g5'] = {
+      status: 'InService', current: 0, desired: 1,
+      activityCode: 'InProgress', activityStartMinAgo: 20,
+    };
+    h.factsByEndpoint['svc-sagemaker-g6e'] = { status: 'InService', current: 1, desired: 1 };
+    h.factsByEndpoint['svc-sagemaker-g7e'] = { status: 'Failed', current: 0, desired: 0 };
+    h.ssmValues[ACTIVE_PARAM] = 'svc-sagemaker-g5';
+
+    await handler();
+
+    const snapshot = JSON.parse(h.ssmValues[CAPACITY_PARAM] as string);
+    expect(snapshot.no_healthy).toBe(false);
+    expect(snapshot.classes).toEqual({
+      'svc-sagemaker-g5': 'DROUGHT',
+      'svc-sagemaker-g6e': 'HEALTHY',
+      'svc-sagemaker-g7e': 'FAILED',
+    });
+    // Fresh enough for the dispatcher's 5-minute freshness window.
+    expect(Date.now() - Date.parse(snapshot.at)).toBeLessThan(60_000);
+  });
+
+  it('publishes no_healthy=true when every pool is dry or dead', async () => {
+    process.env.SAGEMAKER_ENDPOINTS = JSON.stringify(CHAIN);
+    h.factsByEndpoint['svc-sagemaker-g5'] = {
+      status: 'InService', current: 0, desired: 1,
+      activityCode: 'InProgress', activityStartMinAgo: 20,
+    };
+    h.factsByEndpoint['svc-sagemaker-g6e'] = {
+      status: 'InService', current: 0, desired: 1,
+      activityCode: 'Unfulfilled', activityStartMinAgo: 30,
+    };
+    h.factsByEndpoint['svc-sagemaker-g7e'] = { status: 'Failed', current: 0, desired: 0 };
+    h.ssmValues[ACTIVE_PARAM] = 'svc-sagemaker-g5';
+
+    await handler();
+
+    const snapshot = JSON.parse(h.ssmValues[CAPACITY_PARAM] as string);
+    expect(snapshot.no_healthy).toBe(true);
+    expect(snapshot.classes['svc-sagemaker-g6e']).toBe('DROUGHT');
+  });
+
+  it('does not abort the election when the capacity write fails', async () => {
+    process.env.SAGEMAKER_ENDPOINTS = JSON.stringify(CHAIN);
+    h.factsByEndpoint['svc-sagemaker-g5'] = {
+      status: 'InService', current: 0, desired: 1,
+      activityCode: 'InProgress', activityStartMinAgo: 20,
+    };
+    h.factsByEndpoint['svc-sagemaker-g6e'] = { status: 'InService', current: 1, desired: 1 };
+    h.factsByEndpoint['svc-sagemaker-g7e'] = { status: 'Failed', current: 0, desired: 0 };
+    h.ssmValues[ACTIVE_PARAM] = 'svc-sagemaker-g5';
+    h.failPutForParams.add(CAPACITY_PARAM);
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    try {
+      const result = await handler();
+
+      // The election still ran and was persisted; only the snapshot is missing.
+      expect(result.flipped).toBe(true);
+      expect(result.active_endpoint).toBe('svc-sagemaker-g6e');
+      expect(h.ssmValues[ACTIVE_PARAM]).toBe('svc-sagemaker-g6e');
+    } finally {
+      h.failPutForParams.delete(CAPACITY_PARAM);
+      errorSpy.mockRestore();
+    }
   });
 });
 
@@ -440,6 +560,79 @@ describe('queued-task rescue + promotion', () => {
       }),
     ]);
     expect(h.webhooks).toEqual([]);
+  });
+
+  it('does not migrate a stranded task its own pool could still serve inside the cold-start window', async () => {
+    // Active (g5 us-east-1) is healthy with a live instance; the task sits in
+    // us-east-2, whose own endpoints are merely DRY — that pool is still
+    // asking AWS for capacity, so a 5-minute-old copy there is more likely to
+    // be duplicated than helped by a re-dispatch.
+    h.factsByEndpoint['svc-sagemaker-g5'] = { status: 'InService', current: 1, desired: 1 };
+    for (const name of ['svc-sagemaker-g5-useast2', 'svc-sagemaker-g6e-useast2', 'svc-sagemaker-g7e-useast2']) {
+      h.factsByEndpoint[name] = {
+        status: 'InService', current: 0, desired: 1,
+        activityCode: 'InProgress', activityStartMinAgo: 20,
+      };
+    }
+    for (const name of ['svc-sagemaker-g6e', 'svc-sagemaker-g7e']) {
+      h.factsByEndpoint[name] = { status: 'Failed', current: 0, desired: 0 };
+    }
+    h.ssmValues[ACTIVE_PARAM] = 'svc-sagemaker-g5';
+    h.tasks = [mkTask({ sagemaker_region: 'us-east-2', inference_started_at: ago(5).toISOString() })];
+
+    const result = await handler();
+
+    expect(result.rescued).toBe(0);
+    expect(result.promoted).toBe(0);
+    expect(h.dispatches).toEqual([]);
+    expect(h.updates).toEqual([]);
+  });
+
+  it('re-dispatches a stranded task once its own pool has had the cold-start window', async () => {
+    h.factsByEndpoint['svc-sagemaker-g5'] = { status: 'InService', current: 1, desired: 1 };
+    for (const name of ['svc-sagemaker-g5-useast2', 'svc-sagemaker-g6e-useast2', 'svc-sagemaker-g7e-useast2']) {
+      h.factsByEndpoint[name] = {
+        status: 'InService', current: 0, desired: 1,
+        activityCode: 'InProgress', activityStartMinAgo: 40,
+      };
+    }
+    for (const name of ['svc-sagemaker-g6e', 'svc-sagemaker-g7e']) {
+      h.factsByEndpoint[name] = { status: 'Failed', current: 0, desired: 0 };
+    }
+    h.ssmValues[ACTIVE_PARAM] = 'svc-sagemaker-g5';
+    h.tasks = [mkTask({ sagemaker_region: 'us-east-2', inference_started_at: ago(25).toISOString() })];
+
+    const result = await handler();
+
+    expect(result.rescued).toBe(1);
+    expect(h.dispatches).toEqual([
+      { task_id: '01JQUEUED01', endpointName: 'svc-sagemaker-g5', region: 'us-east-1' },
+    ]);
+    expect(h.updates).toEqual([
+      expect.objectContaining({
+        Key: { pk: 'TASK#01JQUEUED01' },
+        UpdateExpression: 'SET sagemaker_region = :region, updated_at = :now',
+      }),
+    ]);
+  });
+
+  it('re-dispatches a young stranded task whose own pool is FAILED (it can never serve its queue)', async () => {
+    h.factsByEndpoint['svc-sagemaker-g5'] = { status: 'InService', current: 1, desired: 1 };
+    for (const name of ['svc-sagemaker-g5-useast2', 'svc-sagemaker-g6e-useast2', 'svc-sagemaker-g7e-useast2']) {
+      h.factsByEndpoint[name] = { status: 'Failed', current: 0, desired: 0 };
+    }
+    for (const name of ['svc-sagemaker-g6e', 'svc-sagemaker-g7e']) {
+      h.factsByEndpoint[name] = { status: 'Failed', current: 0, desired: 0 };
+    }
+    h.ssmValues[ACTIVE_PARAM] = 'svc-sagemaker-g5';
+    h.tasks = [mkTask({ sagemaker_region: 'us-east-2', inference_started_at: ago(3).toISOString() })];
+
+    const result = await handler();
+
+    expect(result.rescued).toBe(1);
+    expect(h.dispatches).toEqual([
+      { task_id: '01JQUEUED01', endpointName: 'svc-sagemaker-g5', region: 'us-east-1' },
+    ]);
   });
 
   it('promotion flips a QUEUED task to IN_PROGRESS in a region with a live instance and enqueues a webhook', async () => {
@@ -597,6 +790,7 @@ describe('queued-task rescue + promotion', () => {
 // ---------------------------------------------------------------------------
 const PIXAL_ACTIVE_PARAM = '/generate/staging/sagemaker/pixal3d/active_endpoint';
 const PIXAL_LAST_FLIP_PARAM = '/generate/staging/sagemaker/pixal3d/last_flip';
+const PIXAL_CAPACITY_PARAM = '/generate/staging/sagemaker/pixal3d/capacity';
 const PIXAL_CHAIN = [
   { region: 'us-east-1', instanceType: 'g5', endpointName: 'svc-sagemaker-pixal3d-g5', inputBucket: 'in-g5-use1', variantName: 'pixal3d' },
   { region: 'us-east-2', instanceType: 'g5', endpointName: 'svc-sagemaker-pixal3d-g5-useast2', inputBucket: 'in-g5-use2', variantName: 'pixal3d' },
@@ -608,6 +802,7 @@ describe('dual-chain election (v1 + v2)', () => {
     process.env.SAGEMAKER_ENDPOINTS_PIXAL3D = JSON.stringify(PIXAL_CHAIN);
     process.env.ACTIVE_ENDPOINT_PARAM_PIXAL3D = PIXAL_ACTIVE_PARAM;
     process.env.LAST_FLIP_PARAM_PIXAL3D = PIXAL_LAST_FLIP_PARAM;
+    process.env.CAPACITY_PARAM_PIXAL3D = PIXAL_CAPACITY_PARAM;
     h.factsByEndpoint = {};
     h.tasks = [];
     h.updates = [];
@@ -616,6 +811,7 @@ describe('dual-chain election (v1 + v2)', () => {
     h.failUpdateForPks.clear();
     delete h.ssmValues[PIXAL_ACTIVE_PARAM];
     delete h.ssmValues[PIXAL_LAST_FLIP_PARAM];
+    delete h.ssmValues[PIXAL_CAPACITY_PARAM];
   });
 
   it('elects each chain independently: a v1 drought does not drag the v2 chain, and flips land in per-chain SSM params', async () => {
@@ -647,6 +843,10 @@ describe('dual-chain election (v1 + v2)', () => {
       'svc-sagemaker-pixal3d-g5': 'HEALTHY',
       'svc-sagemaker-pixal3d-g5-useast2': 'DROUGHT',
     });
+    // Each chain publishes its snapshot to its OWN parameter.
+    const v2Snapshot = JSON.parse(h.ssmValues[PIXAL_CAPACITY_PARAM] as string);
+    expect(v2Snapshot.classes).toEqual(result.pixal3d?.classes);
+    expect(v2Snapshot.no_healthy).toBe(false);
   });
 
   it('rescue is chain-scoped: a stranded v2 task goes to the v2 active endpoint, a stranded v1 task to the v1 one', async () => {

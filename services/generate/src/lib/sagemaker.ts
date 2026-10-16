@@ -8,6 +8,11 @@
  * dispatcher and the capacity sentinel both stage a task's input into the
  * elected endpoint's regional input bucket and invoke that endpoint, so
  * the staging + invoke pair lives here once.
+ *
+ * Also home to the chain's capacity-snapshot helpers: the sentinel publishes
+ * each chain's per-endpoint classes every minute and the dispatcher spreads
+ * new work across every non-FAILED pool while the chain has no HEALTHY entry
+ * (see ChainCapacityState / pickSpreadEndpoint).
  */
 
 import { S3Client, CopyObjectCommand } from '@aws-sdk/client-s3';
@@ -114,6 +119,89 @@ function parseEndpointEntries(parsed: unknown): EndpointConfig[] {
     throw new Error('SAGEMAKER_ENDPOINTS is empty');
   }
   return configs;
+}
+
+/**
+ * One chain's capacity snapshot, published every minute by the capacity
+ * sentinel to that chain's capacity SSM parameter and read by the
+ * dispatcher. `classes` is keyed by endpoint NAME (unique per region x type,
+ * the same key `active_endpoint` stores); `no_healthy` means no entry of the
+ * chain can serve right now, so new work is spread across the pools that are
+ * still trying instead of piling onto one.
+ */
+export type CapacityClass = 'FAILED' | 'DROUGHT' | 'PROVISIONING' | 'HEALTHY';
+export interface ChainCapacityState {
+  at: string;
+  no_healthy: boolean;
+  classes: Record<string, CapacityClass>;
+}
+
+/**
+ * Parse the sentinel's capacity snapshot. Unset, empty, unparseable, or
+ * structurally invalid input returns undefined, and the caller then falls
+ * back to the elected endpoint (the pre-spread behaviour) — a malformed or
+ * missing snapshot can never break a dispatch.
+ */
+export function parseChainCapacityState(raw: string | undefined): ChainCapacityState | undefined {
+  if (!raw) return undefined;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return undefined;
+  }
+  if (typeof parsed !== 'object' || parsed === null) return undefined;
+  const { at, no_healthy, classes } = parsed as Record<string, unknown>;
+  if (typeof at !== 'string' || !Number.isFinite(Date.parse(at))) return undefined;
+  if (typeof no_healthy !== 'boolean') return undefined;
+  if (typeof classes !== 'object' || classes === null) return undefined;
+  return { at, no_healthy, classes: classes as Record<string, CapacityClass> };
+}
+
+/**
+ * A snapshot older than `maxAgeMs` is ignored: if the sentinel stops writing
+ * (Lambda failure, ssm:PutParameter denied) the dispatcher reverts to the
+ * single elected endpoint rather than spreading on stale evidence.
+ */
+export function chainCapacityIsFresh(state: ChainCapacityState, maxAgeMs = 5 * 60 * 1000): boolean {
+  return Date.now() - Date.parse(state.at) <= maxAgeMs;
+}
+
+/**
+ * Deterministic placement across every pool the chain has not written off.
+ * DROUGHT and PROVISIONING pools are eligible on purpose: during a
+ * chain-wide drought every pool still asking AWS for capacity should hold a
+ * share of the backlog, so whichever one is granted capacity drains
+ * immediately. This is placement, never duplication — the task is invoked at
+ * exactly one endpoint, so there is no copy left behind to withdraw (a
+ * queued async request cannot be cancelled).
+ *
+ * Same task id always lands on the same pool, so a retry of the same task
+ * does not fan out across the chain.
+ */
+export function pickSpreadEndpoint(
+  configs: EndpointConfig[],
+  state: ChainCapacityState,
+  taskId: string,
+): EndpointConfig {
+  // Unknown/absent class keys count as non-FAILED (fail-open): a chain entry
+  // added between the sentinel's write and this read is dispatched to rather
+  // than dead-ended.
+  const eligible = configs.filter((c) => state.classes[c.endpointName] !== 'FAILED');
+  // An empty eligible list makes the modulo NaN, so the lookup is undefined
+  // for both "every entry is FAILED" and (unreachably) an out-of-range index.
+  const picked = eligible[sumOfCharCodes(taskId) % eligible.length];
+  if (!picked) {
+    throw new Error('No dispatchable endpoint in chain (every entry is FAILED)');
+  }
+  return picked;
+}
+
+/** Stable spread hash: same task id -> same pool, across runs and regions. */
+function sumOfCharCodes(value: string): number {
+  let sum = 0;
+  for (let i = 0; i < value.length; i += 1) sum += value.charCodeAt(i);
+  return sum;
 }
 
 /**
