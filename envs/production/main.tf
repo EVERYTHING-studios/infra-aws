@@ -164,6 +164,8 @@ module "inference" {
   sagemaker_instance_types    = var.sagemaker_instance_types
   sagemaker_max_capacity      = var.sagemaker_max_capacity
   sagemaker_candidate_regions = var.sagemaker_candidate_regions
+  pixal3d_enabled             = var.pixal3d_enabled
+  pixal3d_instance_types      = var.pixal3d_instance_types
 }
 
 module "pipeline" {

@@ -45,3 +45,12 @@ sagemaker_max_capacity = 1
 # production 1 fits, artifacts replicated via
 # trellis2image/scripts/replicate_artifacts.sh).
 sagemaker_candidate_regions = ["us-east-1", "us-east-2"]
+
+# Precision v2 (Pixal3D) production enable (matches staging tfvars:58-76):
+# g6e-only — the g5 v2 tier was dropped 2026-10-05 for the g5 RAM cliff and
+# g7e is excluded for Blackwell capacity (comment at sagemaker_instance_types
+# above). Weights tar + both regional pixal3d_s3_uri SSM params are in place
+# (server-side S3 copy of the staging tar, package_weights.sh:241-270 — the
+# tar is weights-only and env-agnostic).
+pixal3d_enabled        = true
+pixal3d_instance_types = ["ml.g6e.2xlarge"]
