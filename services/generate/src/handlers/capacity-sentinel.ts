@@ -18,8 +18,41 @@ import type { TaskRecord } from '../lib/types.js';
 
 /** How recent a successful scale-up stays valid as capacity proof for failback. */
 const PROOF_WINDOW_MS = 60 * 60 * 1000;
-/** A scale-up in flight this long with zero instances is a drought, not provisioning. */
+/**
+ * A scale-up in flight this long with zero instances is a drought, not
+ * provisioning. This is the PRIMARY trigger, not a backstop of last resort:
+ * AWS's authoritative signals arrive far later than the clock does. Measured
+ * on the 2026-10-15 us-east-2 ml.g6e.2xlarge shortage — FailureReason naming
+ * InsufficientInstanceCapacity appeared ~40 min in (inferred from
+ * LastModifiedTime 21:21:34Z; the API exposes no timestamp for it), the
+ * autoscaling activity opened 20:43:56Z and only closed Unfulfilled at
+ * 22:44:26Z (2h00m), while this 15-minute rule fired at 20:59:07Z — the
+ * first DROUGHT line in the sentinel log, ~16 min after the request.
+ *
+ * Deliberately NOT raised: a successful cold start takes 5-6 min (7 of the 8
+ * successful scale-ups on the two staging v2 pools: 4.9, 5.0, 5.5, 5.6, 6.0,
+ * 6.1, 8.7 min; outliers 31.5 and 50.8 min), so 15 min is ~2.5x a typical
+ * start, and a FALSE DROUGHT is nearly free — it only orders routing (the
+ * pool keeps DesiredInstanceCount=1, keeps retrying on SageMaker's side, and
+ * stays in the dispatcher's spread set). A longer window would only delay the
+ * two things that help during a shortage: failing over to a pool that can
+ * serve, and spreading work across every pool still trying.
+ */
 const STALE_PROVISIONING_MS = 15 * 60 * 1000;
+/**
+ * Rescue only what a pool can no longer plausibly serve. A queued async
+ * request can NEVER be cancelled (no stop/cancel operation exists for
+ * endpoint invocations), so every re-dispatch is a permanent second copy in
+ * the abandoned pool's queue that burns a full render whenever that pool is
+ * next granted capacity. Measured cold start is ~20 min
+ * (docs/customer-api-staging-smoke-test.md, results row 3: "scale-up alarm
+ * tripped 05:56Z, ~20 min to provision") and the one observed rescue (task
+ * 01M50HW06VJGCQS942G2DPTDEF, dispatched 19:50:49Z, re-dispatched 20:11:07Z)
+ * was 20.3 min in — so a task younger than that is more likely to be
+ * duplicated than helped. A task whose own pool is FAILED (never serves its
+ * queue again) is rescued regardless of age.
+ */
+const RESCUE_MIN_QUEUE_MS = 20 * 60 * 1000;
 const ssm = new SSMClient({});
 const docClient = DynamoDBDocumentClient.from(new DynamoDBClient({}), {
   marshallOptions: { removeUndefinedValues: true },
@@ -40,10 +73,19 @@ const docClient = DynamoDBDocumentClient.from(new DynamoDBClient({}), {
  *
  * Classification per endpoint:
  *   FAILED       endpoint status Failed (never self-heals; needs manual recreate)
- *   DROUGHT      desired >= 1 but current = 0 and the latest scaling activity
- *                ended Unfulfilled/Failed — proven no capacity
+ *   DROUGHT      desired >= 1 but current = 0 with hard no-capacity evidence:
+ *                FailureReason naming InsufficientInstanceCapacity, or the
+ *                latest scaling activity ended Unfulfilled/Failed, or a
+ *                scale-up has been in flight longer than
+ *                STALE_PROVISIONING_MS — proven no capacity
  *   PROVISIONING endpoint Creating/Updating, or a scale-up attempt in flight
  *   HEALTHY      InService and (current >= 1 or desired = 0) and not DROUGHT
+ *
+ * DROUGHT is a per-run ROUTING HINT, never a lockout: a dry pool keeps
+ * DesiredInstanceCount=1 and keeps retrying on SageMaker's side, it stays in
+ * the dispatcher's spread set, and the label only orders which pool a NEW
+ * task is sent to while a healthy pool exists (see the capacity parameter
+ * this sentinel publishes each run).
  *
  * Election (candidate order in SAGEMAKER_ENDPOINTS = chain priority):
  *   1. Active is HEALTHY/PROVISIONING -> only flip to a HIGHER-priority
@@ -82,6 +124,14 @@ export interface EndpointFacts {
   latestActivityStatusCode?: string;
   latestActivityDescription?: string;
   latestActivityStart?: Date;
+  /**
+   * DescribeEndpoint's top-level FailureReason. During the 2026-10-15
+   * shortage the us-east-2 g6e endpoint reported "Unable to provision all
+   * the requested ML compute capacity due to InsufficientInstanceCapacity"
+   * here while its status stayed InService at zero instances — the earliest
+   * hard no-capacity evidence AWS exposes.
+   */
+  failureReason?: string;
   /** Most recent successful scale-out activity start ("to N", N >= 1) — capacity-allocation signal for billing. */
   scaleUpStart?: Date;
 }
@@ -112,6 +162,7 @@ async function describeRegion(conf: EndpointConfig): Promise<EndpointFacts> {
     status: endpoint.EndpointStatus ?? 'Unknown',
     current,
     desired,
+    failureReason: endpoint.FailureReason,
     latestActivityStatusCode: latest?.StatusCode,
     latestActivityDescription: latest?.Description,
     latestActivityStart: latest?.StartTime,
@@ -127,21 +178,31 @@ export function classify(facts: EndpointFacts): { class: RegionClass; proven: bo
   if (facts.status === 'Failed') {
     return { class: 'FAILED', proven: false };
   }
+  // DROUGHT is evaluated BEFORE the provisioning branch so that explicit
+  // no-capacity evidence (FailureReason naming InsufficientInstanceCapacity,
+  // or an activity already closed Unfulfilled/Failed) wins over a scale-up
+  // that merely looks in-flight — a dry pool keeps re-issuing attempts, so
+  // "in flight" is true in the slow-start AND the dry case and must not
+  // extend the clock. The only behaviour the reorder changes beyond the new
+  // FailureReason evidence is an endpoint whose status is
+  // Creating/Updating/SystemUpdating while autoscaling has already declared
+  // its scale-out Unfulfilled/Failed: that is a drought, not provisioning.
+  if (
+    facts.current === 0 &&
+    facts.desired >= 1 &&
+    (facts.latestActivityStatusCode === 'Unfulfilled' ||
+      facts.latestActivityStatusCode === 'Failed' ||
+      /InsufficientInstanceCapacity/.test(facts.failureReason ?? '') ||
+      staleProvisioning(facts))
+  ) {
+    return { class: 'DROUGHT', proven: false };
+  }
   const creating = facts.status === 'Creating' || facts.status === 'Updating' || facts.status === 'SystemUpdating';
   const scalingInFlight =
     facts.desired > facts.current &&
     (facts.latestActivityStatusCode === 'Pending' || facts.latestActivityStatusCode === 'InProgress');
   if ((creating || scalingInFlight) && !staleProvisioning(facts)) {
     return { class: 'PROVISIONING', proven: false };
-  }
-  if (
-    facts.current === 0 &&
-    facts.desired >= 1 &&
-    (facts.latestActivityStatusCode === 'Unfulfilled' ||
-      facts.latestActivityStatusCode === 'Failed' ||
-      staleProvisioning(facts))
-  ) {
-    return { class: 'DROUGHT', proven: false };
   }
   const proven = facts.current >= 1 || recentScaleUpSucceeded(facts);
   return { class: 'HEALTHY', proven };
@@ -310,13 +371,19 @@ interface ChainResult {
 /**
  * One precision chain's election + rescue + promotion pass. The chains are
  * fully independent: separate endpoint lists, separate active_endpoint /
- * last_flip SSM params, separate cooldowns. `stranded` is this chain's slice
- * of the handler's single stranded-task query (partitioned by task.model).
+ * last_flip / capacity SSM params, separate cooldowns. `stranded` is this
+ * chain's slice of the handler's single stranded-task query (partitioned by
+ * task.model).
+ *
+ * The run ends by publishing the chain's capacity snapshot to
+ * `capacityParam` — the dispatcher's input for spreading new work across
+ * every non-FAILED pool while the chain has no HEALTHY entry.
  */
 async function runChain(
   configs: EndpointConfig[],
   activeParam: string,
   lastFlipParam: string,
+  capacityParam: string,
   cooldownSeconds: number,
   model: 'precision-v1' | 'precision-v2',
   stranded: TaskRecord[],
@@ -406,6 +473,18 @@ async function runChain(
     for (const task of stranded) {
       const taskRegion = task.sagemaker_region ?? 'us-east-1';
       if (taskRegion === activeState.conf.region) continue;
+      // Rescue is the ONLY path that creates a second invocation of a task,
+      // and a queued async request can never be cancelled — so a gratuitous
+      // rescue is permanent duplicate spend. Skip a task its own pool can
+      // still serve inside a plausible cold-start window (a dry-pool
+      // ping-pong would otherwise multiply queued copies). A task whose own
+      // pool is FAILED can never be served from there, so it is rescued
+      // regardless of age; a task with no dispatch stamp keeps the old
+      // behaviour (rescued).
+      const dispatchedMs = task.inference_started_at ? Date.parse(task.inference_started_at) : NaN;
+      const queuedMs = Number.isFinite(dispatchedMs) ? Date.now() - dispatchedMs : Infinity;
+      const sourceRegionFailed = states.some((s) => s.conf.region === taskRegion && s.class === 'FAILED');
+      if (!sourceRegionFailed && queuedMs < RESCUE_MIN_QUEUE_MS) continue;
       try {
         await dispatchToRegion(task, activeState.conf);
         await docClient.send(
@@ -443,6 +522,28 @@ async function runChain(
     );
   }
 
+  // ---- capacity snapshot ------------------------------------------------
+  // Publish this chain's per-endpoint classes so the dispatcher can spread
+  // new work across every non-FAILED pool while no entry is HEALTHY. A
+  // failed write must NEVER abort the election: the dispatcher falls back to
+  // the single elected endpoint once the snapshot is stale.
+  try {
+    await ssm.send(
+      new PutParameterCommand({
+        Name: capacityParam,
+        Value: JSON.stringify({
+          at: new Date().toISOString(),
+          no_healthy: !states.some((s) => s.class === 'HEALTHY'),
+          classes,
+        }),
+        Type: 'String',
+        Overwrite: true,
+      }),
+    );
+  } catch (err) {
+    console.error(`Failed to publish capacity state to ${capacityParam}`, err);
+  }
+
   return { active_endpoint: activeEndpoint, flipped, classes, rescued, promoted };
 }
 
@@ -466,6 +567,7 @@ export async function handler(): Promise<
     v1Configs,
     requireEnv('ACTIVE_ENDPOINT_PARAM'),
     requireEnv('LAST_FLIP_PARAM'),
+    requireEnv('CAPACITY_PARAM'),
     cooldownSeconds,
     'precision-v1',
     stranded.filter((t) => (t.model ?? 'precision-v1') === 'precision-v1'),
@@ -477,6 +579,7 @@ export async function handler(): Promise<
     v2Configs,
     requireEnv('ACTIVE_ENDPOINT_PARAM_PIXAL3D'),
     requireEnv('LAST_FLIP_PARAM_PIXAL3D'),
+    requireEnv('CAPACITY_PARAM_PIXAL3D'),
     cooldownSeconds,
     'precision-v2',
     stranded.filter((t) => t.model === 'precision-v2'),
