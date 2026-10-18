@@ -133,7 +133,8 @@ warm from prior scale-up):
 With the custom `EndpointIdle` metric alarm (3 evaluation periods):
 **~3 min** (3-min alarm evaluation + ~30s scale-down activity). This is both
 safe and fast — the metric stays `0` (busy) while any `sagemaker_task_token`
-exists, so the alarm cannot fire mid-inference. See
+exists or the endpoint's own `ApproximateBacklogSize` is non-zero, so the
+alarm cannot fire mid-inference or on a pool still holding queued work. See
 [Scale-to-zero](../modules/generate-inference/sagemaker-region/README.md#scale-to-zero)
 in the sagemaker-region module README.
 

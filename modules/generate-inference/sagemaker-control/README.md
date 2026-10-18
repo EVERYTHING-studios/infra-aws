@@ -26,8 +26,10 @@ SageMaker has no native multi-region or multi-instance-type routing. An
 instance type's capacity in a region is only proven by real provisioning
 attempts, so the design keeps an endpoint deployed for every (type, region)
 pair in the chain (free at zero instances), drives provisioning with real
-tasks, and **elects** the active endpoint from live evidence in cold-price
-chain order.
+tasks, **elects** the active endpoint from live evidence in cold-price
+chain order, and **spreads** new work across the whole chain whenever no
+pool can serve — every pool keeps asking AWS for capacity, so a shortage
+costs queue time instead of stalling the chain on one pool.
 
 ## Lambdas
 
@@ -47,12 +49,28 @@ immediately — it does NOT wait for inference. The Step Functions task token
 and the target region (`sagemaker_region`, bookkeeping only — the callback
 derives truth from the SNS subscription ARN) are stored on the task record.
 
+**Spreading while the chain is dry.** Before using the election the
+dispatcher reads the chain's capacity snapshot (the sentinel's
+`capacity` param, ≤ 5 min old). If that snapshot says `no_healthy` — no pool
+of the chain can serve right now — the task is placed on
+`eligible[sumOfCharCodes(task_id) % eligible.length]` over every chain entry
+whose class is not `FAILED`, instead of on the elected endpoint. Every dry
+pool is still asking AWS for capacity and whichever one is granted it drains
+immediately, so holding a share of the backlog on each is what keeps the
+chain moving. This is **placement, never duplication**: one task is invoked
+at exactly one endpoint, and a queued async request cannot be cancelled, so
+there is no copy left behind to withdraw or pay for. The chosen entry's
+region/type are persisted as usual, so the scaler and sentinel attribute the
+task correctly. The election is untouched whenever any entry is HEALTHY
+(including a stale or unreadable snapshot, or a missing `ParameterNotFound`
+param — the pre-spread behaviour).
+
 Env: `TASKS_TABLE`, `WORK_BUCKET`, `SAGEMAKER_ENDPOINTS`,
-`ACTIVE_ENDPOINT_PARAM`, `SAGEMAKER_ENDPOINTS_PIXAL3D`,
-`ACTIVE_ENDPOINT_PARAM_PIXAL3D`. The task's `model`
+`ACTIVE_ENDPOINT_PARAM`, `CAPACITY_PARAM`, `SAGEMAKER_ENDPOINTS_PIXAL3D`,
+`ACTIVE_ENDPOINT_PARAM_PIXAL3D`, `CAPACITY_PARAM_PIXAL3D`. The task's `model`
 (`event.model ?? task.model ?? precision-v1`) selects the chain: v2 tasks
-read the pixal3d param and endpoint list; a v2 task on a v2-off environment
-fails fast with a clear error.
+read the pixal3d param, capacity param and endpoint list; a v2 task on a
+v2-off environment fails fast with a clear error.
 
 ### Callback (`...-sagemaker-callback`)
 
@@ -83,14 +101,21 @@ Queries the tasks table GSI2 for IN_PROGRESS tasks with an active
 `EverythingStudios/SageMaker` **for every configured endpoint each run**
 (dimension `EndpointName`): value 0 (busy) if any in-flight task is
 attributed to that endpoint's region (via the task's `sagemaker_region`
-attribute; legacy records without it attribute to us-east-1), else 1 (idle).
-Busy attribution stays region-keyed by design: with multiple endpoints per
-region this marks every sibling endpoint in a busy region busy too —
-over-conservative by <= one cooldown (bounded cents, never kills a
-mid-inference render) and needs no new task attribute. Per-endpoint
-publication keeps every scale-to-zero alarm fed and lets abandoned endpoints
-drain after a flip. Safe default 0 on error — never scale down on monitoring
-failure.
+attribute; legacy records without it attribute to us-east-1) **or that
+endpoint's own `ApproximateBacklogSize` Maximum over the last 5 min is > 0**,
+else 1 (idle). Busy attribution stays region-keyed by design: with multiple
+endpoints per region this marks every sibling endpoint in a busy region busy
+too — over-conservative by <= one cooldown (bounded cents, never kills a
+mid-inference render) and needs no new task attribute. Region-keyed
+attribution alone is not sufficient, though: a rescued task leaves its
+original copy in the abandoned pool's queue while its record names only the
+NEW region, so that pool's backlog is invisible to a region-keyed set. The
+per-endpoint backlog read (one `cloudwatch:GetMetricData` call per candidate
+region, one query per endpoint) closes that hole — a pool holding queued work
+is never published idle, so its scale-to-zero alarm cannot override the
+backlog-driven scale-up. Per-endpoint publication keeps every scale-to-zero
+alarm fed and lets abandoned endpoints drain after a flip. Safe default 0 on
+error — never scale down on monitoring failure.
 
 Env: `TASKS_TABLE`, `SAGEMAKER_ENDPOINTS`, `SAGEMAKER_ENDPOINTS_PIXAL3D`
 (both chains' endpoints are fed; `[]` = the v2 chain is absent).
@@ -102,14 +127,16 @@ Runs every minute (same EventBridge rule as the scaler). Describes every
 configured endpoint (`sagemaker:DescribeEndpoint`) and its scaling
 activities (`application-autoscaling:DescribeScalingActivities` on resource
 `endpoint/<name>/variant/<variantName>`, per chain), classifies each
-endpoint, elects the active one, and re-dispatches stranded tasks — the
+endpoint, elects the active one, publishes the chain's capacity snapshot for
+the dispatcher's spread decision, and re-dispatches stranded tasks — the
 whole pass runs independently per precision chain with per-chain SSM
 params, and stranded tasks are partitioned by their own `model` so neither
 chain rescues the other's tasks. Details below.
 
 Env: `TASKS_TABLE`, `WORK_BUCKET`, `SAGEMAKER_ENDPOINTS`,
-`ACTIVE_ENDPOINT_PARAM`, `LAST_FLIP_PARAM`, `SAGEMAKER_ENDPOINTS_PIXAL3D`,
-`ACTIVE_ENDPOINT_PARAM_PIXAL3D`, `LAST_FLIP_PARAM_PIXAL3D`,
+`ACTIVE_ENDPOINT_PARAM`, `LAST_FLIP_PARAM`, `CAPACITY_PARAM`,
+`SAGEMAKER_ENDPOINTS_PIXAL3D`, `ACTIVE_ENDPOINT_PARAM_PIXAL3D`,
+`LAST_FLIP_PARAM_PIXAL3D`, `CAPACITY_PARAM_PIXAL3D`,
 `FLIP_COOLDOWN_SECONDS` (300, shared by both chains).
 
 ## EventBridge
@@ -151,6 +178,15 @@ When the v2 chain is deployed, a second pair per region covers its
 - `/generate/${env}/sagemaker/pixal3d/active_endpoint` and
   `.../pixal3d/last_flip` — the v2 (Pixal3D) chain's pair, identical
   semantics; created only when `endpoints_pixal3d` is non-empty.
+- `/generate/${env}/sagemaker/capacity` — the chain's capacity snapshot,
+  rewritten by the sentinel every minute and read by the dispatcher:
+  `{"at":"<ISO>","no_healthy":<bool>,"classes":{"<endpoint name>":
+  "FAILED"|"DROUGHT"|"PROVISIONING"|"HEALTHY"}}`. Terraform seeds it with an
+  epoch timestamp and `no_healthy: false` so a dispatcher reading it before
+  the first sentinel run falls back to the election; a snapshot older than
+  5 min is ignored for the same reason. Same `ignore_changes`.
+- `/generate/${env}/sagemaker/pixal3d/capacity` — the v2 chain's snapshot,
+  identical semantics; created only when `endpoints_pixal3d` is non-empty.
 
 ## Endpoint classification
 
@@ -158,12 +194,28 @@ From `describe-endpoint` + scaling-activity evidence, per endpoint:
 
 - `FAILED` — endpoint status `Failed`. Never self-heals; the sentinel never
   elects it. Recovery is manual (see `sagemaker-region/README.md`).
-- `DROUGHT` — InService/Updating with desired >= 1 but current = 0 and the
-  latest scaling activity ended `Unfulfilled`/`Failed` — proven no capacity.
+- `DROUGHT` — desired >= 1 but current = 0 with hard no-capacity evidence:
+  a `FailureReason` naming `InsufficientInstanceCapacity`, or the latest
+  scaling activity ended `Unfulfilled`/`Failed`, or a scale-up has been in
+  flight longer than 15 min. On the 2026-10-15 us-east-2 `ml.g6e.2xlarge`
+  shortage the evidence arrived in that order — `FailureReason` ~40 min in
+  (inferred from `LastModifiedTime`; the API exposes no timestamp for it),
+  the activity's `Unfulfilled` after 2h00m, and the 15-min rule at ~16 min —
+  so the clock is the primary trigger and the explicit signals are fast-lane
+  confirmations, not the reverse. A false DROUGHT is nearly free: it only
+  orders routing (the pool keeps `DesiredInstanceCount=1`, keeps retrying on
+  SageMaker's side, and stays in the dispatcher's spread set), which is why
+  the window is deliberately not raised — measured successful cold starts are
+  5-6 min (7 of the 8 successful scale-ups on the two staging v2 pools:
+  4.9, 5.0, 5.5, 5.6, 6.0, 6.1, 8.7 min; outliers 31.5 and 50.8 min), so
+  15 min is ~2.5x a typical start, and a longer window would only delay
+  failover and the spread.
 - `PROVISIONING` — endpoint status Creating/Updating/SystemUpdating, or a
   scale-up attempt in flight (desired > current with a Pending/InProgress
-  activity). A provisioning attempt takes 15-25 min to prove itself; flipping
-  mid-provisioning would thrash.
+  activity) that is not DROUGHT. A fresh activity `StartTime` is a retry, not
+  progress: dry pools re-issue attempts indefinitely (us-east-1 opened four
+  `set to 1` attempts across 20:32Z-23:58Z on 2026-10-15, each left open ~1 h
+  with no instance), so an in-flight attempt never extends the clock.
 - `HEALTHY` — InService and (current >= 1 or desired = 0) and not DROUGHT.
   Within HEALTHY, a region is **proven** if an instance is running now or the
   latest scaling activity recently scaled UP successfully (within 1 h). A
@@ -187,8 +239,11 @@ region.
    Idle-unproven counts here — the flip itself is the probe: the next task's
    backlog alarm scales that endpoint from zero; success proves capacity,
    `Unfulfilled` (~10-30 min) refutes it and the sentinel moves on.
-3. No HEALTHY candidate → stay. Every endpoint keeps retrying for free;
-   tasks wait on the state machine timeout and the cancel API cleans them up.
+3. No HEALTHY candidate → stay, and **spread**: new tasks are placed across
+   every non-FAILED pool (see the dispatcher), so each pool holds a share of
+   the backlog and whichever one AWS grants capacity to drains immediately.
+   Every endpoint keeps retrying for free; tasks wait on the state-machine
+   timeout and the cancel API cleans them up.
 
 Every flip writes the elected endpoint name to `active_endpoint` +
 `last_flip` and is rate-limited by the 300 s cooldown (anti-flapping;
@@ -208,6 +263,19 @@ late duplicate callback from the abandoned region hits an already-consumed
 token — the callback's consumed-token guard makes it a logged no-op. Net
 effect: a drought onset costs an in-flight task ~10-35 min (evidence + flip
 + re-dispatch) instead of the 1 h state-machine timeout.
+
+**Cold-start window.** Rescue is the only path that creates a second
+invocation of a task, and a queued async request can never be cancelled — the
+abandoned copy stays in the old pool's queue and burns a full render whenever
+that pool is next granted capacity, so every gratuitous rescue is potential
+duplicate spend. A task whose own pool could still serve it is therefore
+skipped for the first 20 min after dispatch (measured cold start ~20 min:
+`docs/customer-api-staging-smoke-test.md`; the one observed rescue, task
+`01M50HW06VJGCQS942G2DPTDEF`, was 20.3 min in). A task whose own pool is
+`FAILED` can never be served from there and is rescued immediately; a task
+with no `inference_started_at` stamp keeps the old behaviour. This bounds the
+dry-pool ping-pong (flip to B → migrate everything → A regains capacity →
+flip back → migrate again) that would otherwise multiply queued copies.
 
 ## Adding a region
 

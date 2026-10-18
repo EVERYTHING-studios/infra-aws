@@ -112,14 +112,19 @@ autoscaling policies:
 - **Scale-up** (`HasBacklogWithoutCapacity >= 1` for 2 min): fires when a request
   is queued with no instance to serve it. Step scaling `+1`, 300s cooldown.
 - **Scale-to-zero** (`EndpointIdle >= 1` for 3 min): fires when no in-flight
-  SageMaker invocation in this region has an active `sagemaker_task_token`. Step
+  SageMaker invocation in this region has an active `sagemaker_task_token`
+  **and this endpoint's own `ApproximateBacklogSize` is 0**. Step
   scaling `-1`, 180s cooldown. `treat_missing_data = breaching` — if the scaler
   Lambda stops publishing, the alarm fires after 3 min as a safety measure
   rather than keeping the instance alive forever. (Busy attribution is
   region-keyed by design: while any endpoint in the region has an in-flight
   task, every sibling endpoint in that region also reports busy — over-
   conservative by one cooldown at most, bounded cents, never kills a
-  mid-inference render.)
+  mid-inference render. The endpoint's own backlog is unioned in on top,
+  because a rescued task leaves its original copy in the abandoned pool's
+  queue while its record names only the new region — that pool must never be
+  published idle, or the scale-to-zero alarm would override the
+  backlog-driven scale-up.)
 
 ### Why a custom metric
 

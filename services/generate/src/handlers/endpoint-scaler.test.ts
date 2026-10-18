@@ -13,6 +13,8 @@ const h = vi.hoisted(() => {
     tasksByStatus: {} as Record<string, TaskRecord[]>,
     // Published CloudWatch datapoints: { region, endpointName, value }.
     metrics: [] as Array<{ region?: string; endpointName?: string; value?: number }>,
+    // ApproximateBacklogSize Maximum per endpoint (absent = no datapoints).
+    backlogByEndpoint: {} as Record<string, number>,
   };
 });
 
@@ -54,7 +56,24 @@ vi.mock('@aws-sdk/lib-dynamodb', () => ({
 vi.mock('@aws-sdk/client-cloudwatch', () => ({
   CloudWatchClient: class {
     constructor(public readonly config: { region?: string }) {}
-    async send(cmd: { input: { MetricData?: Array<{ Dimensions?: Array<{ Name: string; Value: string }>; Value?: number }> } }) {
+    async send(cmd: {
+      input: {
+        MetricData?: Array<{ Dimensions?: Array<{ Name: string; Value: string }>; Value?: number }>;
+        MetricDataQueries?: Array<{
+          Id?: string;
+          MetricStat?: { Metric: { Dimensions?: Array<{ Name: string; Value: string }> } };
+        }>;
+      };
+    }) {
+      if (cmd.input.MetricDataQueries) {
+        return {
+          MetricDataResults: cmd.input.MetricDataQueries.map((query) => {
+            const endpointName = query.MetricStat?.Metric.Dimensions?.[0]?.Value ?? '';
+            const backlog = h.backlogByEndpoint[endpointName];
+            return { Id: query.Id, Values: backlog === undefined ? [] : [backlog] };
+          }),
+        };
+      }
       for (const datum of cmd.input.MetricData ?? []) {
         h.metrics.push({
           region: this.config.region,
@@ -66,6 +85,9 @@ vi.mock('@aws-sdk/client-cloudwatch', () => ({
     }
   },
   PutMetricDataCommand: class {
+    constructor(public readonly input: unknown) {}
+  },
+  GetMetricDataCommand: class {
     constructor(public readonly input: unknown) {}
   },
 }));
@@ -108,6 +130,7 @@ beforeAll(() => {
 beforeEach(() => {
   h.tasksByStatus = {};
   h.metrics = [];
+  h.backlogByEndpoint = {};
 });
 
 describe('endpoint-scaler', () => {
@@ -120,6 +143,21 @@ describe('endpoint-scaler', () => {
     expect(h.metrics).toEqual([
       { region: 'us-east-1', endpointName: 'svc-sagemaker-g5', value: 0 },
       { region: 'us-west-2', endpointName: 'svc-sagemaker-g5-usw2', value: 1 },
+    ]);
+  });
+
+  it('counts an endpoint holding its own async backlog as busy even when no task names its region', async () => {
+    // The post-rescue leftover case: the record names the NEW region while
+    // the abandoned pool still holds a queued copy. Publishing it idle would
+    // let scale-to-zero override the backlog-driven scale-up.
+    h.backlogByEndpoint['svc-sagemaker-g5-usw2'] = 1;
+
+    const result = await handler();
+
+    expect(result).toEqual({ idle: 0 });
+    expect(h.metrics).toEqual([
+      { region: 'us-east-1', endpointName: 'svc-sagemaker-g5', value: 1 },
+      { region: 'us-west-2', endpointName: 'svc-sagemaker-g5-usw2', value: 0 },
     ]);
   });
 

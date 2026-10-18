@@ -1,7 +1,15 @@
 import { SSMClient, GetParameterCommand } from '@aws-sdk/client-ssm';
 import { getTask, updateTask } from '../lib/tasks-repo.js';
 import { requireEnv } from '../lib/env.js';
-import { parseEndpointConfig, dispatchToRegion, type EndpointConfig } from '../lib/sagemaker.js';
+import {
+  parseEndpointConfig,
+  parseChainCapacityState,
+  chainCapacityIsFresh,
+  pickSpreadEndpoint,
+  dispatchToRegion,
+  type ChainCapacityState,
+  type EndpointConfig,
+} from '../lib/sagemaker.js';
 import { enqueueWebhook } from '../lib/webhook-queue.js';
 import type { PrecisionModel } from '../lib/types.js';
 
@@ -17,6 +25,13 @@ const ssm = new SSMClient({});
  * persists the task token and the target region on the task record so the
  * callback can recover both, and returns immediately — it does NOT wait for
  * inference.
+ *
+ * While the chain has NO healthy pool (every entry dry or dead — the
+ * sentinel's capacity snapshot says `no_healthy`), the elected endpoint is
+ * not the useful answer: every dry pool is still asking AWS for capacity and
+ * whichever one is granted it drains immediately, so the task is instead
+ * placed deterministically across every non-FAILED pool. Placement, never
+ * duplication: one task is invoked at exactly one endpoint.
  *
  * The state machine stays parked on the task token until the callback Lambda
  * calls SendTaskSuccess/SendTaskFailure.
@@ -34,18 +49,22 @@ interface ChainEnv {
   endpointsEnv: string;
   /** Env var holding the chain's active-endpoint SSM parameter name. */
   activeParamEnv: string;
+  /** Env var holding the chain's capacity-snapshot SSM parameter name. */
+  capacityParamEnv: string;
 }
 
 const TRELLIS_CHAIN: ChainEnv = {
   endpointsEnv: 'SAGEMAKER_ENDPOINTS',
   activeParamEnv: 'ACTIVE_ENDPOINT_PARAM',
+  capacityParamEnv: 'CAPACITY_PARAM',
 };
 const PIXAL3D_CHAIN: ChainEnv = {
   endpointsEnv: 'SAGEMAKER_ENDPOINTS_PIXAL3D',
   activeParamEnv: 'ACTIVE_ENDPOINT_PARAM_PIXAL3D',
+  capacityParamEnv: 'CAPACITY_PARAM_PIXAL3D',
 };
 
-async function getActiveEndpointConfig(chain: ChainEnv): Promise<EndpointConfig> {
+async function getActiveEndpointConfig(chain: ChainEnv, configs: EndpointConfig[]): Promise<EndpointConfig> {
   const paramName = requireEnv(chain.activeParamEnv);
   const result = await ssm.send(new GetParameterCommand({ Name: paramName }));
   const activeEndpoint = result.Parameter?.Value;
@@ -53,7 +72,6 @@ async function getActiveEndpointConfig(chain: ChainEnv): Promise<EndpointConfig>
     throw new Error(`SSM parameter ${paramName} has no value`);
   }
 
-  const configs = parseEndpointConfig(requireEnv(chain.endpointsEnv));
   const conf = configs.find((c) => c.endpointName === activeEndpoint);
   if (!conf) {
     throw new Error(
@@ -62,6 +80,23 @@ async function getActiveEndpointConfig(chain: ChainEnv): Promise<EndpointConfig>
     );
   }
   return conf;
+}
+
+/**
+ * Read the sentinel's capacity snapshot for this chain. A missing parameter
+ * (`ParameterNotFound` — e.g. an environment applied before the capacity
+ * parameter existed) is "no state", not an error: the dispatcher then uses
+ * the elected endpoint.
+ */
+async function getChainCapacity(chain: ChainEnv): Promise<ChainCapacityState | undefined> {
+  const paramName = requireEnv(chain.capacityParamEnv);
+  try {
+    const result = await ssm.send(new GetParameterCommand({ Name: paramName }));
+    return parseChainCapacityState(result.Parameter?.Value);
+  } catch (err) {
+    if (err instanceof Error && err.name === 'ParameterNotFound') return undefined;
+    throw err;
+  }
 }
 
 export async function handler(event: DispatchInput): Promise<{ dispatched: true }> {
@@ -79,7 +114,17 @@ export async function handler(event: DispatchInput): Promise<{ dispatched: true 
     throw new Error('Task requested precision-v2 but no Pixal3D chain is configured (SAGEMAKER_ENDPOINTS_PIXAL3D is unset)');
   }
 
-  const conf = await getActiveEndpointConfig(chain);
+  const configs = parseEndpointConfig(requireEnv(chain.endpointsEnv));
+
+  // While no pool of this chain is healthy, spread new work across every
+  // pool still asking AWS for capacity instead of stacking it on the elected
+  // one — whichever is granted capacity drains immediately. A chain with any
+  // HEALTHY entry keeps the cost-ordered single-endpoint election.
+  const capacity = await getChainCapacity(chain);
+  const conf =
+    capacity && capacity.no_healthy && chainCapacityIsFresh(capacity)
+      ? pickSpreadEndpoint(configs, capacity, task.task_id)
+      : await getActiveEndpointConfig(chain, configs);
 
   // v2 (pixal3d) runs the multi-view pipeline; multi-image requests get the
   // manifest payload, single-image stays the raw-body (MV V=1) path. v1

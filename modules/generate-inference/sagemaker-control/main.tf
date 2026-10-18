@@ -8,8 +8,8 @@
 #   - the EventBridge rate(1 minute) rule targeting scaler + sentinel,
 #   - per-topic SNS invoke permissions for the callback Lambda, one pair per
 #     candidate region,
-#   - the `active_endpoint` / `last_flip` SSM parameters the sentinel mutates
-#     at runtime (value changes are ignored here).
+#   - the `active_endpoint` / `last_flip` / `capacity` SSM parameters the
+#     sentinel mutates at runtime (value changes are ignored here).
 #
 # The regional stacks (buckets, per-type Models/Endpoints, topics,
 # autoscaling) live in the sibling `sagemaker-region/` module, one instance
@@ -122,6 +122,21 @@ resource "aws_ssm_parameter" "last_flip" {
   }
 }
 
+# The chain's capacity snapshot, rewritten by the sentinel every minute and
+# read by the dispatcher to decide between the elected endpoint and a spread
+# across every non-FAILED pool. Epoch + no_healthy=false so a dispatcher that
+# reads it before the first sentinel run falls back to the elected endpoint.
+resource "aws_ssm_parameter" "capacity" {
+  name        = "/generate/${var.env}/sagemaker/capacity"
+  description = "Per-endpoint capacity classes for the v1 (TRELLIS) chain, published by the capacity-sentinel Lambda every minute."
+  type        = "String"
+  value       = "{\"at\":\"1970-01-01T00:00:00.000Z\",\"no_healthy\":false,\"classes\":{}}"
+
+  lifecycle {
+    ignore_changes = [value]
+  }
+}
+
 # The Precision v2 (Pixal3D) chain's election pair — identical semantics
 # under the pixal3d/ namespace. Created only when the v2 chain is deployed.
 resource "aws_ssm_parameter" "active_endpoint_pixal3d" {
@@ -147,6 +162,21 @@ resource "aws_ssm_parameter" "last_flip_pixal3d" {
   type        = "String"
   # Epoch so the first flip is never blocked by the cooldown.
   value = "1970-01-01T00:00:00.000Z"
+
+  lifecycle {
+    ignore_changes = [value]
+  }
+}
+
+# The v2 chain's capacity snapshot — same shape and semantics as
+# aws_ssm_parameter.capacity, under the pixal3d/ namespace.
+resource "aws_ssm_parameter" "capacity_pixal3d" {
+  count = local.pixal_chain ? 1 : 0
+
+  name        = "/generate/${var.env}/sagemaker/pixal3d/capacity"
+  description = "Per-endpoint capacity classes for the v2 (Pixal3D) chain, published by the capacity-sentinel Lambda every minute."
+  type        = "String"
+  value       = "{\"at\":\"1970-01-01T00:00:00.000Z\",\"no_healthy\":false,\"classes\":{}}"
 
   lifecycle {
     ignore_changes = [value]
@@ -182,6 +212,8 @@ data "aws_iam_policy_document" "dispatcher" {
     resources = compact([
       aws_ssm_parameter.active_endpoint.arn,
       try(aws_ssm_parameter.active_endpoint_pixal3d[0].arn, null),
+      aws_ssm_parameter.capacity.arn,
+      try(aws_ssm_parameter.capacity_pixal3d[0].arn, null),
     ])
   }
 
@@ -215,6 +247,8 @@ module "dispatcher" {
     ACTIVE_ENDPOINT_PARAM         = aws_ssm_parameter.active_endpoint.name
     SAGEMAKER_ENDPOINTS_PIXAL3D   = local.endpoints_pixal3d_json
     ACTIVE_ENDPOINT_PARAM_PIXAL3D = try(aws_ssm_parameter.active_endpoint_pixal3d[0].name, "")
+    CAPACITY_PARAM                = aws_ssm_parameter.capacity.name
+    CAPACITY_PARAM_PIXAL3D        = try(aws_ssm_parameter.capacity_pixal3d[0].name, "")
     WEBHOOK_QUEUE_URL             = local.webhook_queue_url
     CUSTOMER_WEBHOOK_QUEUE_URL    = local.customer_webhook_queue_url
   }
@@ -269,9 +303,10 @@ module "callback" {
 }
 
 # ------------------------------------------------------------------
-# Scaler Lambda: publishes EndpointIdle for EVERY configured region each
-# run (0 if that region has IN_PROGRESS token-bearing tasks, else 1) so
-# each region's scale-to-zero alarm stays fed and abandoned regions drain
+# Scaler Lambda: publishes EndpointIdle for EVERY configured endpoint each
+# run (0 if that endpoint's region has IN_PROGRESS/QUEUED token-bearing
+# tasks or the endpoint's own ApproximateBacklogSize is non-zero, else 1) so
+# each endpoint's scale-to-zero alarm stays fed and abandoned endpoints drain
 # after a flip.
 # ------------------------------------------------------------------
 
@@ -283,6 +318,15 @@ data "aws_iam_policy_document" "scaler" {
 
   statement {
     actions   = ["cloudwatch:PutMetricData"]
+    resources = ["*"]
+  }
+
+  # Per-endpoint ApproximateBacklogSize reads (one GetMetricData call per
+  # candidate region) — a pool holding queued work must never be published
+  # idle. The action does not support useful resource scoping, same rationale
+  # as the sentinel's DescribeScalingActivities statement.
+  statement {
+    actions   = ["cloudwatch:GetMetricData"]
     resources = ["*"]
   }
 }
@@ -306,9 +350,11 @@ module "endpoint_scaler" {
 
 # ------------------------------------------------------------------
 # Capacity-sentinel Lambda: classifies every configured endpoint from
-# DescribeEndpoint + DescribeScalingActivities evidence, flips
-# active_endpoint per the election rules (with cooldown), and re-dispatches
-# stranded tasks to the active endpoint.
+# DescribeEndpoint (status, instance counts, FailureReason) +
+# DescribeScalingActivities evidence, flips active_endpoint per the election
+# rules (with cooldown), publishes each chain's capacity snapshot for the
+# dispatcher's spread decision, and re-dispatches stranded tasks to the
+# active endpoint.
 # ------------------------------------------------------------------
 
 data "aws_iam_policy_document" "sentinel" {
@@ -330,6 +376,8 @@ data "aws_iam_policy_document" "sentinel" {
       aws_ssm_parameter.last_flip.arn,
       try(aws_ssm_parameter.active_endpoint_pixal3d[0].arn, null),
       try(aws_ssm_parameter.last_flip_pixal3d[0].arn, null),
+      aws_ssm_parameter.capacity.arn,
+      try(aws_ssm_parameter.capacity_pixal3d[0].arn, null),
     ])
   }
 
@@ -383,9 +431,11 @@ module "capacity_sentinel" {
     SAGEMAKER_ENDPOINTS           = local.endpoints_json
     ACTIVE_ENDPOINT_PARAM         = aws_ssm_parameter.active_endpoint.name
     LAST_FLIP_PARAM               = aws_ssm_parameter.last_flip.name
+    CAPACITY_PARAM                = aws_ssm_parameter.capacity.name
     SAGEMAKER_ENDPOINTS_PIXAL3D   = local.endpoints_pixal3d_json
     ACTIVE_ENDPOINT_PARAM_PIXAL3D = try(aws_ssm_parameter.active_endpoint_pixal3d[0].name, "")
     LAST_FLIP_PARAM_PIXAL3D       = try(aws_ssm_parameter.last_flip_pixal3d[0].name, "")
+    CAPACITY_PARAM_PIXAL3D        = try(aws_ssm_parameter.capacity_pixal3d[0].name, "")
     FLIP_COOLDOWN_SECONDS         = "300"
     WEBHOOK_QUEUE_URL             = local.webhook_queue_url
     CUSTOMER_WEBHOOK_QUEUE_URL    = local.customer_webhook_queue_url
