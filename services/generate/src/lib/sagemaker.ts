@@ -10,7 +10,7 @@
  * the staging + invoke pair lives here once.
  */
 
-import { S3Client, CopyObjectCommand } from '@aws-sdk/client-s3';
+import { S3Client, CopyObjectCommand, GetObjectCommand, PutObjectCommand } from '@aws-sdk/client-s3';
 import { SageMakerRuntimeClient, InvokeEndpointAsyncCommand } from '@aws-sdk/client-sagemaker-runtime';
 import type { TaskRecord } from './types.js';
 import { requireEnv } from './env.js';
@@ -117,31 +117,78 @@ function parseEndpointEntries(parsed: unknown): EndpointConfig[] {
 }
 
 /**
- * Stage the task's input image (prepare writes `tasks/{id}/input/0` in the
- * work bucket) into the target region's SageMaker input bucket, then start
- * `InvokeEndpointAsync` against that region's endpoint. `InferenceId =
- * task_id` so the callback recovers the task from the SNS notification.
+ * Stage the task's input into the target region's SageMaker input bucket,
+ * then start `InvokeEndpointAsync` against that region's endpoint.
+ * `InferenceId = task_id` so the callback recovers the task from the SNS
+ * notification.
+ *
+ * Two payload shapes:
+ * - single-image (default, and every v1 request): copy `tasks/{id}/input/0`
+ *   to `{prefix}/input.png` — the raw-image body the servers have always
+ *   accepted;
+ * - `multiview && image_urls.length > 1` (multi-image-to-3d on the v2
+ *   chain): fetch EVERY staged view `tasks/{id}/input/{i}` from the work
+ *   bucket (prepare stages all of them), base64 them into the JSON manifest
+ *   the v2 server accepts (`{images, azimuths_deg}`, azimuths defaulted to
+ *   90 * (i + 1) when the request omitted them), PutObject it as
+ *   `{prefix}/input.json`, and point the invoke at that. Payload math:
+ *   <= 4 staged images -> well under SageMaker's 1 GB async cap.
  *
  * The S3 and SageMaker clients are constructed per call with the target
  * region — the S3 client's region must match the destination bucket's
  * region, and InvokeEndpointAsync is regional.
  */
-export async function dispatchToRegion(task: TaskRecord, conf: EndpointConfig): Promise<void> {
+export async function dispatchToRegion(
+  task: TaskRecord,
+  conf: EndpointConfig,
+  multiview: boolean = false,
+): Promise<void> {
   const workBucket = requireEnv('WORK_BUCKET');
   const artifactPrefix = task.artifact_prefix ?? `tasks/${task.task_id}`;
-
-  const sourceKey = `${artifactPrefix}/input/0`;
-  const inputKey = `${artifactPrefix}/input.png`;
   const s3 = new S3Client({ region: conf.region });
-  await s3.send(
-    new CopyObjectCommand({
-      Bucket: conf.inputBucket,
-      Key: inputKey,
-      CopySource: `${workBucket}/${sourceKey}`,
-      ContentType: 'image/png',
-      MetadataDirective: 'REPLACE',
-    }),
-  );
+
+  const imageCount = task.input.image_urls?.length ?? 1;
+  let inputKey: string;
+
+  if (multiview && imageCount > 1) {
+    const images: string[] = [];
+    for (let i = 0; i < imageCount; i++) {
+      const res = await s3.send(
+        new GetObjectCommand({
+          Bucket: workBucket,
+          Key: `${artifactPrefix}/input/${i}`,
+        }),
+      );
+      if (!res.Body) {
+        throw new Error(`missing staged input ${artifactPrefix}/input/${i} in ${workBucket}`);
+      }
+      const bytes = await res.Body.transformToByteArray();
+      images.push(Buffer.from(bytes).toString('base64'));
+    }
+    const azimuths =
+      task.input.view_azimuths_deg ??
+      Array.from({ length: imageCount - 1 }, (_, i) => 90 * (i + 1));
+    inputKey = `${artifactPrefix}/input.json`;
+    await s3.send(
+      new PutObjectCommand({
+        Bucket: conf.inputBucket,
+        Key: inputKey,
+        Body: JSON.stringify({ images, azimuths_deg: azimuths }),
+        ContentType: 'application/json',
+      }),
+    );
+  } else {
+    inputKey = `${artifactPrefix}/input.png`;
+    await s3.send(
+      new CopyObjectCommand({
+        Bucket: conf.inputBucket,
+        Key: inputKey,
+        CopySource: `${workBucket}/${artifactPrefix}/input/0`,
+        ContentType: 'image/png',
+        MetadataDirective: 'REPLACE',
+      }),
+    );
+  }
 
   const sagemaker = new SageMakerRuntimeClient({ region: conf.region });
   await sagemaker.send(

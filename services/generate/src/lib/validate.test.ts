@@ -93,6 +93,59 @@ describe('validateCreateTask', () => {
     ).toThrow(/valid URL/);
   });
 
+  it('accepts well-formed view_azimuths_deg on multi-image-to-3d', () => {
+    const result = validateCreateTask({
+      type: 'multi-image-to-3d',
+      input: {
+        image_urls: ['https://a.example/1.png', 'https://a.example/2.png', 'https://a.example/3.png'],
+        view_azimuths_deg: [135, 250],
+      },
+      output: OUTPUT,
+    });
+    expect(result.input.view_azimuths_deg).toEqual([135, 250]);
+  });
+
+  it('rejects view_azimuths_deg with the wrong entry count', () => {
+    expect(() =>
+      validateCreateTask({
+        type: 'multi-image-to-3d',
+        input: {
+          image_urls: ['https://a.example/1.png', 'https://a.example/2.png', 'https://a.example/3.png'],
+          view_azimuths_deg: [90],
+        },
+        output: OUTPUT,
+      }),
+    ).toThrow(/exactly 2 entries/);
+  });
+
+  it('rejects non-finite or out-of-range azimuths', () => {
+    for (const bad of [-10, 360, Number.NaN, '90']) {
+      expect(() =>
+        validateCreateTask({
+          type: 'multi-image-to-3d',
+          input: {
+            image_urls: ['https://a.example/1.png', 'https://a.example/2.png'],
+            view_azimuths_deg: [bad as number],
+          },
+          output: OUTPUT,
+        }),
+      ).toThrow(/\[0, 360\)/);
+    }
+  });
+
+  it('rejects view_azimuths_deg on the single-image type', () => {
+    // image-to-3d takes exactly one image: azimuths never apply, so a
+    // request carrying them fails at the edge instead of being silently
+    // ignored mid-pipeline.
+    expect(() =>
+      validateCreateTask({
+        type: 'image-to-3d',
+        input: { image_urls: ['https://a.example/1.png'], view_azimuths_deg: [90] },
+        output: OUTPUT,
+      }),
+    ).toThrow(/only accepted on multi-image-to-3d/);
+  });
+
   it('requires UUID output hints for non-refine types', () => {
     expect(() =>
       validateCreateTask({ type: 'text-to-3d-preview', input: { prompt: 'x' } }),

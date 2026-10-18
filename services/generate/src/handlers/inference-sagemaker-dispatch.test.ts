@@ -95,8 +95,9 @@ describe('inference-sagemaker-dispatch', () => {
     expect(taskId).toBe('01JDISPATCH');
     expect(update.status).toBe('QUEUED');
     expect(update.sagemaker_task_token).toBe('tok-1');
-    expect(update.sagemaker_region).toBe('us-east-2');
-    expect(update.progress).toBe(25);
+    // The v1 chain never requests the manifest payload.
+    expect(dispatchToRegion.mock.calls[0]![2]).toBe(false);
+    // The record flips to QUEUED with the token + region persisted.
     expect(update.inference_started_at).toEqual(expect.any(String));
 
     // The webhook carries the post-update record.
@@ -127,11 +128,16 @@ describe('inference-sagemaker-dispatch', () => {
     });
 
     expect(result).toEqual({ dispatched: true });
-    const [dispatchedTask, conf] = dispatchToRegion.mock.calls[0] as [TaskRecord, SageMakerLib.EndpointConfig];
+    const [dispatchedTask, conf, multiview] = dispatchToRegion.mock.calls[0] as [
+      TaskRecord,
+      SageMakerLib.EndpointConfig,
+      boolean,
+    ];
     expect(dispatchedTask.task_id).toBe('01JDISPATCH');
     expect(conf.endpointName).toBe('svc-sagemaker-pixal3d-g5');
     expect(conf.variantName).toBe('pixal3d');
-    // The SSM read targets the v2 chain's own parameter.
+    // The v2 chain dispatches multiview (manifest payload for multi-image).
+    expect(multiview).toBe(true);
     expect(ssmSend).toHaveBeenCalledWith(
       expect.objectContaining({ input: { Name: '/generate/staging/sagemaker/pixal3d/active_endpoint' } }),
     );

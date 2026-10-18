@@ -63,6 +63,9 @@ function assertDataImageUri(value: string, field: string): void {
 
 /** Per-type input validation shared by the web-app task and customer job endpoints. */
 function validateTaskInput(type: TaskType, input: Record<string, unknown>, allowDataUris: boolean = false): void {
+  if (input.view_azimuths_deg !== undefined && type !== 'multi-image-to-3d') {
+    throw new ValidationError('input.view_azimuths_deg is only accepted on multi-image-to-3d');
+  }
   switch (type) {
     case 'text-to-3d-preview': {
       if (typeof input.prompt !== 'string' || input.prompt.trim().length === 0) {
@@ -99,6 +102,29 @@ function validateTaskInput(type: TaskType, input: Record<string, unknown>, allow
           assertDataImageUri(url, 'input.image_urls');
         } else {
           assertHttpUrl(url, 'input.image_urls');
+        }
+      }
+      if (type === 'multi-image-to-3d') {
+        // Optional per-extra-view azimuths: one per image after the first,
+        // each finite in [0, 360). Absent = the dispatcher's 90/180/270
+        // default; present-but-wrong is rejected so bad requests fail at
+        // the API edge instead of mid-pipeline.
+        const azimuths = input.view_azimuths_deg;
+        if (azimuths !== undefined) {
+          if (!Array.isArray(azimuths)) {
+            throw new ValidationError('input.view_azimuths_deg must be an array of numbers');
+          }
+          if (azimuths.length !== urls.length - 1) {
+            throw new ValidationError(
+              `input.view_azimuths_deg needs exactly ${urls.length - 1} entries ` +
+                `(one per extra image), got ${azimuths.length}`,
+            );
+          }
+          for (const az of azimuths) {
+            if (typeof az !== 'number' || !Number.isFinite(az) || az < 0 || az >= 360) {
+              throw new ValidationError('input.view_azimuths_deg entries must be finite numbers in [0, 360)');
+            }
+          }
         }
       }
       break;
