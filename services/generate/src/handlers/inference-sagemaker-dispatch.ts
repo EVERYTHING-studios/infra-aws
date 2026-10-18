@@ -126,7 +126,10 @@ export async function handler(event: DispatchInput): Promise<{ dispatched: true 
       ? pickSpreadEndpoint(configs, capacity, task.task_id)
       : await getActiveEndpointConfig(chain, configs);
 
-  await dispatchToRegion(task, conf);
+  // v2 (pixal3d) runs the multi-view pipeline; multi-image requests get the
+  // manifest payload, single-image stays the raw-body (MV V=1) path. v1
+  // keeps today's single-image dispatch.
+  await dispatchToRegion(task, conf, model === 'precision-v2');
 
   // Persist the task token so the callback can resume the state machine, and
   // the target region so the scaler and sentinel can attribute the task.

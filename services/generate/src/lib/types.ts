@@ -35,6 +35,10 @@ export interface TaskInput {
   prompt?: string;
   negative_prompt?: string;
   image_urls?: string[];
+  /** For multi-image-to-3d: one azimuth (degrees, [0, 360)) per EXTRA image,
+   *  i.e. len == image_urls.length - 1. Absent -> the dispatcher defaults to
+   *  90 * (i + 1) (image 2 = left 90, 3 = back 180, 4 = right 270). */
+  view_azimuths_deg?: number[];
   /** For text-to-3d-refine: the preview task whose geometry gets textured. */
   preview_task_id?: string;
 }

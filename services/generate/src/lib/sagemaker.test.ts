@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   parseEndpointConfig,
   parseOptionalEndpointConfig,
@@ -128,6 +128,179 @@ describe('parseOptionalEndpointConfig', () => {
     expect(() =>
       parseOptionalEndpointConfig('[{"region":"us-east-1","instanceType":"g5","endpointName":"e","inputBucket":"b","variantName":3}]'),
     ).toThrow(/variantName must be a string/);
+  });
+});
+
+// --- dispatchToRegion: staged-input payload shapes -------------------------
+//
+// The S3/SageMaker clients are mocked at the module boundary; commands are
+// captured as plain objects so the tests pin the wire contract: which keys
+// are read/written, the manifest shape for multi-image v2, and the invoke's
+// InputLocation.
+
+const s3Send = vi.fn();
+const smSend = vi.fn();
+
+vi.mock('@aws-sdk/client-s3', () => ({
+  S3Client: class {
+    region: string;
+    constructor(cfg: { region: string }) {
+      this.region = cfg.region;
+    }
+    send = (...args: unknown[]) => s3Send(...args);
+  },
+  CopyObjectCommand: class {
+    constructor(public readonly input: Record<string, unknown>) {}
+  },
+  GetObjectCommand: class {
+    constructor(public readonly input: Record<string, unknown>) {}
+  },
+  PutObjectCommand: class {
+    constructor(public readonly input: Record<string, unknown>) {}
+  },
+}));
+
+vi.mock('@aws-sdk/client-sagemaker-runtime', () => ({
+  SageMakerRuntimeClient: class {
+    send = (...args: unknown[]) => smSend(...args);
+  },
+  InvokeEndpointAsyncCommand: class {
+    constructor(public readonly input: Record<string, unknown>) {}
+  },
+}));
+
+import { dispatchToRegion, type EndpointConfig } from './sagemaker.js';
+import type { TaskRecord } from './types.js';
+
+const CONF: EndpointConfig = {
+  region: 'us-east-2',
+  instanceType: 'g6e',
+  endpointName: 'svc-sagemaker-pixal3d-g6e',
+  inputBucket: 'in-pixal-use2',
+  variantName: 'pixal3d',
+};
+
+const baseTask = {
+  task_id: '01JMV',
+  artifact_prefix: 'tasks/01JMV',
+  input: {},
+} as unknown as TaskRecord;
+
+beforeEach(() => {
+  s3Send.mockReset();
+  smSend.mockReset().mockResolvedValue({});
+  process.env.WORK_BUCKET = 'work-bucket-test';
+});
+
+describe('dispatchToRegion', () => {
+  it('single-image: copies tasks/{id}/input/0 to input.png and invokes the raw-body location', async () => {
+    await dispatchToRegion(baseTask, CONF);
+
+    expect(s3Send).toHaveBeenCalledTimes(1);
+    const copy = s3Send.mock.calls[0]![0]!.input as Record<string, unknown>;
+    expect(copy).toEqual({
+      Bucket: 'in-pixal-use2',
+      Key: 'tasks/01JMV/input.png',
+      CopySource: 'work-bucket-test/tasks/01JMV/input/0',
+      ContentType: 'image/png',
+      MetadataDirective: 'REPLACE',
+    });
+    expect(smSend).toHaveBeenCalledTimes(1);
+    expect(smSend.mock.calls[0]![0]!.input).toEqual({
+      EndpointName: 'svc-sagemaker-pixal3d-g6e',
+      InputLocation: 's3://in-pixal-use2/tasks/01JMV/input.png',
+      InferenceId: '01JMV',
+      InvocationTimeoutSeconds: 3600,
+    });
+  });
+
+  it('multi-image multiview: reads every staged view, writes the manifest, invokes input.json', async () => {
+    s3Send.mockImplementation(async (cmd: { input: Record<string, unknown> }) => {
+      // PutObject (carries Body) -> {}; GetObject -> fake image bytes.
+      if ('Body' in cmd.input) return {};
+      return { Body: { transformToByteArray: async () => new Uint8Array([0xab, 0xcd]) } };
+    });
+    const task = {
+      ...baseTask,
+      input: { image_urls: ['https://a/1.png', 'https://a/2.png', 'https://a/3.png'] },
+    } as TaskRecord;
+
+    await dispatchToRegion(task, CONF, true);
+
+    // GetObject x3 from the WORK bucket, then one PutObject.
+    const gets = s3Send.mock.calls
+      .map((c) => c[0]!.input as Record<string, unknown>)
+      .filter((i) => !('Body' in i) && !('CopySource' in i));
+    expect(gets).toEqual([
+      { Bucket: 'work-bucket-test', Key: 'tasks/01JMV/input/0' },
+      { Bucket: 'work-bucket-test', Key: 'tasks/01JMV/input/1' },
+      { Bucket: 'work-bucket-test', Key: 'tasks/01JMV/input/2' },
+    ]);
+    const put = s3Send.mock.calls
+      .map((c) => c[0]!.input as Record<string, unknown>)
+      .find((i) => i.ContentType === 'application/json')!;
+    expect(put.Bucket).toBe('in-pixal-use2');
+    expect(put.Key).toBe('tasks/01JMV/input.json');
+    const manifest = JSON.parse(put.Body as string);
+    expect(manifest).toEqual({
+      images: ['q80=', 'q80=', 'q80='],
+      azimuths_deg: [90, 180], // default: 90 * (i + 1) per extra image
+    });
+    expect(smSend.mock.calls[0]![0]!.input).toMatchObject({
+      InputLocation: 's3://in-pixal-use2/tasks/01JMV/input.json',
+      InferenceId: '01JMV',
+    });
+  });
+
+  it('multi-image multiview: honors explicit view_azimuths_deg', async () => {
+    s3Send.mockResolvedValue({ Body: { transformToByteArray: async () => new Uint8Array([1]) } });
+    const task = {
+      ...baseTask,
+      input: {
+        image_urls: ['https://a/1.png', 'https://a/2.png'],
+        view_azimuths_deg: [250],
+      },
+    } as TaskRecord;
+
+    await dispatchToRegion(task, CONF, true);
+
+    const put = s3Send.mock.calls
+      .map((c) => c[0]!.input as Record<string, unknown>)
+      .find((i) => i.ContentType === 'application/json')!;
+    expect(JSON.parse(put.Body as string).azimuths_deg).toEqual([250]);
+  });
+
+  it('multi-image WITHOUT the multiview flag keeps the single-image path (v1 chain)', async () => {
+    const task = {
+      ...baseTask,
+      input: { image_urls: ['https://a/1.png', 'https://a/2.png'] },
+    } as TaskRecord;
+
+    await dispatchToRegion(task, CONF, false);
+
+    const copy = s3Send.mock.calls[0]![0]!.input as Record<string, unknown>;
+    expect(copy.Key).toBe('tasks/01JMV/input.png');
+    expect(smSend.mock.calls[0]![0]!.input).toMatchObject({
+      InputLocation: 's3://in-pixal-use2/tasks/01JMV/input.png',
+    });
+  });
+
+  it('single-image task on the multiview chain stays raw-body (MV V=1)', async () => {
+    const task = { ...baseTask, input: { image_urls: ['https://a/1.png'] } } as TaskRecord;
+    await dispatchToRegion(task, CONF, true);
+    const copy = s3Send.mock.calls[0]![0]!.input as Record<string, unknown>;
+    expect(copy.Key).toBe('tasks/01JMV/input.png');
+  });
+
+  it('throws when a staged view is missing from the work bucket', async () => {
+    s3Send.mockResolvedValue({}); // no Body
+    const task = {
+      ...baseTask,
+      input: { image_urls: ['https://a/1.png', 'https://a/2.png'] },
+    } as TaskRecord;
+
+    await expect(dispatchToRegion(task, CONF, true)).rejects.toThrow(/missing staged input/);
+    expect(smSend).not.toHaveBeenCalled();
   });
 });
 
